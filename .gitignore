@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 录音/数据(不入库)
+*.wav
+*.flac
+*.npy
+data/
+recordings/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 图表输出
+*.png
+*.svg
+!docs/**/*.png
