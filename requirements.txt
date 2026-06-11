@@ -4,3 +4,10 @@ scipy>=1.9
 
 # 实时麦克风采集(离线/自测不需要)
 sounddevice>=0.4
+
+# ML 分类基线(classifier.py / predict.py)
+scikit-learn>=1.2
+joblib>=1.2
+
+# 读取音频文件(predict.py 处理 wav / PhysioNet 加载)
+soundfile>=0.12

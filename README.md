@@ -85,6 +85,27 @@ print(res["rhythm"])                      # 节律指标
 print(res["murmur"])                      # 杂音提示
 ```
 
+## 正常/异常分类(ML 基线)
+
+把上述全部 DSP/临床特征拼成特征向量,接 scikit-learn 的 HistGradientBoosting
+(原生支持缺失值)做"正常 vs 异常"二分类。**加载即用,无需自己训练**:
+
+```bash
+python classifier.py --train-demo     # 生成 demo 模型(已随仓库提供 model_demo.joblib)
+python predict.py recording.wav       # 对一段录音预测(异常概率 + 可解释线索)
+python predict.py --selftest          # 合成杂音信号自检
+```
+
+```
+判定: 异常   异常概率 [████████████████████] 1.00
+心率 72 BPM (置信度 0.93) | SQI 0.73
+杂音: 疑似收缩期杂音 (递增-递减/钻石型/中收缩期)
+```
+
+> ⚠️ 随仓库的 `model_demo.joblib` 是**合成数据训练**的,仅验证流程、**勿信真实结果**。
+> 要真正可用,在真实数据上训练:`python classifier.py --train-physionet <CirCor目录>`
+> (PhysioNet/CinC 2016 格式)。现成预训练模型现状见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
 ## 处理管线
 
 ```
