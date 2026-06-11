@@ -182,9 +182,13 @@ class HeartSoundAnalyzer:
         rr = np.diff(s1) / self.fs * 1000.0            # 毫秒
         mean_rr = float(rr.mean())
         cv = float(rr.std() / (mean_rr + 1e-12))
-        d = np.diff(rr)
-        sd1 = float(np.std(d) / np.sqrt(2))
-        sd2 = float(np.sqrt(max(0.0, 2 * rr.var() - 0.5 * np.var(d))))
+        d = np.diff(rr)                                 # 相邻 RR 之差
+        sd1 = float(np.std(d) / np.sqrt(2))             # Poincaré 短期变异
+        sd2 = float(np.sqrt(max(0.0, 2 * rr.var() - 0.5 * np.var(d))))  # 长期
+        # 标准时域 HRV(Task Force 1996)
+        sdnn = float(rr.std())                          # RR 总体标准差
+        rmssd = float(np.sqrt(np.mean(d ** 2))) if len(d) else 0.0
+        pnn50 = float(np.mean(np.abs(d) > 50.0) * 100) if len(d) else 0.0
         # 早搏:相对局部中位数偏离 >20% 的间期
         med = np.median(rr)
         ectopic = int(np.sum(np.abs(rr - med) > 0.20 * med))
@@ -198,7 +202,9 @@ class HeartSoundAnalyzer:
         return {
             "classification": cls, "n_rr": int(len(rr)),
             "mean_bpm": 60000.0 / (mean_rr + 1e-12), "cv": cv,
-            "sd1_ms": sd1, "sd2_ms": sd2, "ectopic": ectopic,
+            "sd1_ms": sd1, "sd2_ms": sd2,
+            "sdnn_ms": sdnn, "rmssd_ms": rmssd, "pnn50_pct": pnn50,
+            "ectopic": ectopic,
         }
 
     def murmur_index(
@@ -237,6 +243,73 @@ class HeartSoundAnalyzer:
             "systolic": sys_idx, "diastolic": dia_idx,
             "flag": "、".join(flags) if flags else "未见明显杂音",
         }
+
+    def systolic_intervals(self, cycles: list[tuple[int, int, int]]) -> dict:
+        """收缩时间间期(STI):收缩期/舒张期时长与比值。
+
+        S1→S2 起点间期 ≈ 机械收缩期(含左室射血时间 LVET 的近似),临床上与
+        心肌收缩力相关(Weissler)。这里给出可解释的时长量,非精确 LVET。
+        """
+        if not cycles:
+            return {"systole_ms": None, "diastole_ms": None}
+        f = self.fs / 1000.0
+        sys_ms = np.array([(s2 - a) / f for a, s2, b in cycles])
+        dia_ms = np.array([(b - s2) / f for a, s2, b in cycles])
+        return {
+            "systole_ms": float(np.median(sys_ms)),    # ≈LVET 近似
+            "diastole_ms": float(np.median(dia_ms)),
+            "sys_dia_ratio": float(np.median(sys_ms) / (np.median(dia_ms) + 1e-9)),
+            "n_cycles": int(len(cycles)),
+        }
+
+    def murmur_shape(
+        self, x_high: np.ndarray, cycles: list[tuple[int, int, int]], n: int = 30
+    ) -> dict:
+        """杂音的形状与时相分类(收缩期)。
+
+        把每个周期的收缩期高频能量包络重采样到固定长度并平均,据其形状判:
+          递增-递减(钻石型)→ 喷射性,见于主动脉/肺动脉瓣狭窄;
+          全收缩期平台型     → 见于二尖瓣反流 / 室间隔缺损;
+          递增 / 递减型      → 见于部分反流 / 二尖瓣脱垂等。
+        时相:按能量峰位置与占空比判 早/中/晚/全收缩期。
+        ⚠️ 启发式提示,非诊断;形状-病变对应仅为听诊学常识,需医师判读。
+        """
+        e = x_high ** 2
+        g = max(1, int(0.04 * self.fs))
+        segs = []
+        for a, s2, b in cycles:
+            lo, hi = a + g, s2 - g                      # 收缩期安静段
+            if hi - lo < n:
+                continue
+            seg = e[lo:hi]
+            seg = signal.resample(seg, n)
+            seg = np.clip(seg, 0, None)
+            mx = seg.max() + 1e-12
+            segs.append(seg / mx)
+        if not segs:
+            return {"shape": "数据不足", "timing": None}
+        env = np.mean(segs, axis=0)
+        env = env / (env.max() + 1e-12)
+        t1, t2, t3 = env[:n // 3].mean(), env[n // 3:2 * n // 3].mean(), \
+            env[2 * n // 3:].mean()
+        peak_pos = float(np.argmax(env) / n)            # 0(早)..1(晚)
+        occupancy = float(np.mean(env > 0.5))           # 高能量占收缩期比例
+
+        if occupancy > 0.7 and (env.max() - env.min()) < 0.5:
+            shape = "全收缩期平台型(疑二尖瓣反流/VSD类)"
+        elif t2 > t1 * 1.15 and t2 > t3 * 1.15:
+            shape = "递增-递减/钻石型(疑主动脉/肺动脉瓣狭窄类)"
+        elif t3 > t1 * 1.3:
+            shape = "递增型(crescendo)"
+        elif t1 > t3 * 1.3:
+            shape = "递减型(decrescendo)"
+        else:
+            shape = "不定形"
+        timing = ("全收缩期" if occupancy > 0.7 else
+                  "早收缩期" if peak_pos < 0.33 else
+                  "中收缩期" if peak_pos < 0.66 else "晚收缩期")
+        return {"shape": shape, "timing": timing,
+                "peak_pos": peak_pos, "occupancy": occupancy}
 
     # --- 信号质量 SQI:分析前的门控(临床数据处理的标准步骤) ----------------
 
@@ -356,7 +429,7 @@ class HeartSoundAnalyzer:
             "env": env,                 # 包络(可视化用)
             "filtered": xb,             # 滤波后波形(可视化用)
             "fs_proc": self.fs,
-            "sqi": None, "rhythm": None, "murmur": None,
+            "sqi": None, "rhythm": None, "sti": None, "murmur": None,
         }
         if screen:
             res["sqi"] = self.signal_quality(xr, conf)
@@ -364,10 +437,16 @@ class HeartSoundAnalyzer:
             s1, s2 = self.segment_hsmm(env, bpm)
             if len(s1) < 3:
                 s1, s2 = self.segment_s1s2(beats)
+            cyc = self._cycles(s1, s2)
             res["rhythm"] = self.analyze_rhythm(s1)
+            res["sti"] = self.systolic_intervals(cyc)
             x_high = signal.sosfiltfilt(self.sos_murmur, xr) \
                 if len(xr) > 50 else xr
-            res["murmur"] = self.murmur_index(x_high, xb, self._cycles(s1, s2))
+            mu = self.murmur_index(x_high, xb, cyc)
+            # 仅在疑似收缩期杂音时进一步做形状/时相分类
+            if mu.get("systolic") and mu["systolic"] > 0.15:
+                mu.update(self.murmur_shape(x_high, cyc))
+            res["murmur"] = mu
         return res
 
 
@@ -458,6 +537,8 @@ class RealtimeHeartRate:
                 line += f"(早搏{rh['ectopic']})"
         if mu and mu.get("flag") not in (None, "数据不足"):
             line += f"   杂音:{mu['flag']}"
+            if mu.get("shape"):     # 疑似杂音时附形状/时相
+                line += f"({mu['shape']}/{mu['timing']})"
         print(line, flush=True)
 
 
@@ -465,16 +546,18 @@ class RealtimeHeartRate:
 # 自测:无麦克风时用合成心音验证算法正确性
 # ---------------------------------------------------------------------------
 def _synthesize(bpm=72.0, secs=8.0, fs=2000.0, noise=0.05, seed=0,
-                irregular=0.0, murmur=0.0):
+                irregular=0.0, murmur=0.0, murmur_shape="plateau"):
     """合成一段含 S1/S2 的心音,用于离线验证。
 
     irregular>0: 每拍周期随机抖动(模拟节律不齐)。
     murmur>0:    收缩期(S1→S2)注入带限噪声(模拟杂音),幅度=该值。
+    murmur_shape: plateau(平台) / diamond(钻石) / crescendo(递增) / decrescendo(递减)。
     """
     rng = np.random.default_rng(seed)
     n = int(secs * fs)
     t = np.arange(n) / fs
     x = np.zeros(n)
+    hp = signal.butter(4, [200, 600], "band", fs=fs, output="sos")
     base = 60.0 / bpm
     t1 = 0.0
     while t1 < secs:
@@ -483,11 +566,20 @@ def _synthesize(bpm=72.0, secs=8.0, fs=2000.0, noise=0.05, seed=0,
             idx = (t > tc) & (t < tc + 0.10)
             tau = t[idx] - tc
             x[idx] += amp * np.sin(2 * np.pi * f * tau) * np.exp(-tau / 0.02)
-        if murmur > 0:             # 收缩期湍流噪声(高频)
-            sysmask = (t > t1 + 0.04) & (t < t2 - 0.03)
-            hp = signal.butter(4, [200, 600], "band", fs=fs, output="sos")
+        if murmur > 0:             # 收缩期湍流噪声(高频),按形状加权
+            lo, hi = t1 + 0.04, t2 - 0.03
+            sysmask = (t > lo) & (t < hi)
+            p = (t[sysmask] - lo) / (hi - lo)          # 收缩期内相对位置 0..1
+            if murmur_shape == "crescendo":
+                w = p
+            elif murmur_shape == "decrescendo":
+                w = 1 - p
+            elif murmur_shape == "diamond":
+                w = 1 - np.abs(2 * p - 1)              # 中间高两端低
+            else:                                       # plateau
+                w = np.ones_like(p)
             burst = signal.sosfilt(hp, rng.standard_normal(n))
-            x[sysmask] += murmur * burst[sysmask]
+            x[sysmask] += murmur * w * burst[sysmask]
         period = base * (1.0 + irregular * rng.standard_normal())
         t1 += max(0.3, period)     # 防止周期过短
     x += noise * rng.standard_normal(n)
@@ -556,5 +648,22 @@ if __name__ == "__main__":
         print(f"[6] SQI门控: 干净 SQI={q_ok['sqi']:.2f}(ok={q_ok['ok']})  "
               f"噪声 SQI={q_bad['sqi']:.2f}(ok={q_bad['ok']})  "
               + ("✅" if ok6 else "❌"))
+
+        # 7) STI: 合成收缩期 0.30s,估计应接近;且收缩<舒张
+        sti = an.analyze(x, fs)["sti"]
+        ok7 = (sti["systole_ms"] is not None
+               and abs(sti["systole_ms"] - 300) < 40
+               and sti["sys_dia_ratio"] < 1.0)
+        print(f"[7] STI: 收缩期≈{sti['systole_ms']:.0f}ms 舒张期≈"
+              f"{sti['diastole_ms']:.0f}ms 比值={sti['sys_dia_ratio']:.2f}  "
+              + ("✅" if ok7 else "❌"))
+
+        # 8) 杂音形状: 注入钻石型应判为"递增-递减/钻石型"
+        xd, _ = _synthesize(bpm=72, secs=12, murmur=0.6,
+                            murmur_shape="diamond", seed=4)
+        md = an.analyze(xd, fs)["murmur"]
+        ok8 = "钻石" in md.get("shape", "")
+        print(f"[8] 杂音形状: 注入钻石型 -> 判定「{md.get('shape')}」"
+              f"({md.get('timing')})  " + ("✅" if ok8 else "❌"))
     else:
         RealtimeHeartRate().run()
