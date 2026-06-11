@@ -61,6 +61,10 @@ class HeartSoundAnalyzer:
         self.sos_murmur = signal.butter(
             4, [murmur_band[0], hi], btype="band", fs=self.fs, output="sos"
         )
+        # 低带:S3/S4 奔马律(舒张期低频额外音)主要在 15-60Hz。
+        self.sos_low = signal.butter(
+            4, [15.0, 60.0], btype="band", fs=self.fs, output="sos"
+        )
         self.env_win = max(1, int(env_smooth_ms / 1000.0 * self.fs))
 
     # --- 各步骤(单独暴露,方便调试/可视化) ---------------------------------
@@ -311,6 +315,99 @@ class HeartSoundAnalyzer:
         return {"shape": shape, "timing": timing,
                 "peak_pos": peak_pos, "occupancy": occupancy}
 
+    def detect_extra_sounds(
+        self, x_low: np.ndarray, cycles: list[tuple[int, int, int]]
+    ) -> dict:
+        """检测舒张期低频额外音 S3 / S4(奔马律)。
+
+        S3(室性奔马律):早舒张期低频音,见于心衰/容量负荷;
+        S4(房性奔马律):晚舒张期(收缩前)低频音,见于心室顺应性下降。
+        在低频带(15-60Hz)能量上,取舒张期早 1/3 与末 1/3 的峰,
+        归一化到 S1 低频响度。
+        ⚠️ 启发式提示,非诊断。
+        """
+        if not cycles:
+            return {"s3": None, "s4": None, "flag": "数据不足"}
+        e = x_low ** 2
+        g = max(1, int(0.04 * self.fs))
+        s1_ref, s3_vals, s4_vals = [], [], []
+        for a, s2, b in cycles:
+            s1_ref.append(e[max(0, a - g): a + g].max())
+            lo, hi = s2 + g, b - g
+            if hi - lo < int(0.12 * self.fs):          # 舒张期太短(快心率)跳过
+                continue
+            dia = e[lo:hi]
+            L = len(dia)
+            s3_vals.append(dia[:L // 3].max())          # 早舒张 → S3
+            s4_vals.append(dia[2 * L // 3:].max())      # 晚舒张(收缩前)→ S4
+        ref = np.median(s1_ref) + 1e-12
+        s3 = float(np.median(s3_vals) / ref) if s3_vals else None
+        s4 = float(np.median(s4_vals) / ref) if s4_vals else None
+        flags = []
+        if s3 is not None and s3 > 0.20:
+            flags.append("疑似S3(室性奔马律,见于心衰)")
+        if s4 is not None and s4 > 0.20:
+            flags.append("疑似S4(房性奔马律)")
+        return {"s3": s3, "s4": s4,
+                "flag": "、".join(flags) if flags else "未见明显额外音"}
+
+    def detect_s2_split(self, x_band: np.ndarray, s2_idx: np.ndarray) -> dict:
+        """估计 S2 分裂(A2–P2 间期,ms)。
+
+        S2 含主动脉瓣(A2)与肺动脉瓣(P2)两个分量,吸气时生理性增宽。
+        宽而固定(不随呼吸变化)的分裂提示房间隔缺损(ASD)。
+        在每个 S2 窗内对细包络(Hilbert)找两个亚峰,取间隔中位数。
+        """
+        if len(s2_idx) == 0:
+            return {"split_ms": None, "flag": "数据不足"}
+        w = int(0.11 * self.fs)                         # S2 窗 ~110ms
+        sm = max(1, int(0.005 * self.fs))               # ~5ms 轻平滑
+        mind = max(1, int(0.015 * self.fs))             # 两峰最小间隔 ~15ms
+        intervals, double = [], 0
+        for s2 in s2_idx:
+            a = int(s2)
+            bb = min(len(x_band), a + w)
+            if bb - a < int(0.05 * self.fs):
+                continue
+            env = np.abs(signal.hilbert(x_band[a:bb]))
+            env = np.convolve(env, np.ones(sm) / sm, mode="same")
+            pk, _ = signal.find_peaks(env, height=0.4 * env.max(), distance=mind)
+            if len(pk) >= 2:
+                double += 1
+                intervals.append((pk[1] - pk[0]) / self.fs * 1000.0)
+        if not intervals:
+            return {"split_ms": 0.0, "split_frac": 0.0,
+                    "flag": "S2 单一(未见明显分裂)"}
+        split = float(np.median(intervals))
+        frac = double / len(s2_idx)
+        if split > 40 and frac > 0.5:
+            flag = "S2 宽分裂(>40ms,若固定不随呼吸变化需排查房间隔缺损)"
+        else:
+            flag = f"S2 分裂(~{split:.0f}ms,生理性多见)"
+        return {"split_ms": split, "split_frac": float(frac), "flag": flag}
+
+    def hrv_frequency(self, s1: np.ndarray, min_rr: int = 20) -> dict:
+        """频域 HRV:LF/HF 比(自主神经平衡)。
+
+        将 RR 间期序列重采样为均匀 4Hz 心动周期图后做 Welch 谱,
+        积分 LF(0.04–0.15Hz)与 HF(0.15–0.40Hz)。
+        ⚠️ 频域 HRV 需较长稳定记录(通常 ≥1–2 分钟),短窗不可靠。
+        """
+        if len(s1) < min_rr + 1:
+            return {"available": False,
+                    "note": f"需 ≥{min_rr} 个心动周期(约 1–2 分钟)才可靠"}
+        rr = np.diff(s1) / self.fs                       # 秒
+        t = np.cumsum(rr)
+        fs_t = 4.0
+        ti = np.arange(0, t[-1], 1.0 / fs_t)
+        rri = np.interp(ti, t, rr)
+        rri = rri - rri.mean()
+        f, p = signal.welch(rri, fs=fs_t, nperseg=min(len(rri), 256))
+        lf = float(p[(f >= 0.04) & (f < 0.15)].sum())
+        hf = float(p[(f >= 0.15) & (f < 0.40)].sum())
+        return {"available": True, "lf": lf, "hf": hf,
+                "lf_hf": float(lf / (hf + 1e-12))}
+
     # --- 信号质量 SQI:分析前的门控(临床数据处理的标准步骤) ----------------
 
     def signal_quality(self, x: np.ndarray, conf: float) -> dict:
@@ -430,6 +527,7 @@ class HeartSoundAnalyzer:
             "filtered": xb,             # 滤波后波形(可视化用)
             "fs_proc": self.fs,
             "sqi": None, "rhythm": None, "sti": None, "murmur": None,
+            "extra_sounds": None, "s2_split": None, "hrv_freq": None,
         }
         if screen:
             res["sqi"] = self.signal_quality(xr, conf)
@@ -440,6 +538,7 @@ class HeartSoundAnalyzer:
             cyc = self._cycles(s1, s2)
             res["rhythm"] = self.analyze_rhythm(s1)
             res["sti"] = self.systolic_intervals(cyc)
+            res["hrv_freq"] = self.hrv_frequency(s1)
             x_high = signal.sosfiltfilt(self.sos_murmur, xr) \
                 if len(xr) > 50 else xr
             mu = self.murmur_index(x_high, xb, cyc)
@@ -447,6 +546,10 @@ class HeartSoundAnalyzer:
             if mu.get("systolic") and mu["systolic"] > 0.15:
                 mu.update(self.murmur_shape(x_high, cyc))
             res["murmur"] = mu
+            x_low = signal.sosfiltfilt(self.sos_low, xr) \
+                if len(xr) > 50 else xr
+            res["extra_sounds"] = self.detect_extra_sounds(x_low, cyc)
+            res["s2_split"] = self.detect_s2_split(xb, s2)
         return res
 
 
@@ -539,6 +642,12 @@ class RealtimeHeartRate:
             line += f"   杂音:{mu['flag']}"
             if mu.get("shape"):     # 疑似杂音时附形状/时相
                 line += f"({mu['shape']}/{mu['timing']})"
+        ex = res.get("extra_sounds")
+        if ex and ex.get("flag") not in (None, "数据不足", "未见明显额外音"):
+            line += f"   {ex['flag']}"
+        sp = res.get("s2_split")
+        if sp and sp.get("split_ms", 0) and sp["split_ms"] > 40:
+            line += f"   {sp['flag']}"
         print(line, flush=True)
 
 
@@ -546,12 +655,15 @@ class RealtimeHeartRate:
 # 自测:无麦克风时用合成心音验证算法正确性
 # ---------------------------------------------------------------------------
 def _synthesize(bpm=72.0, secs=8.0, fs=2000.0, noise=0.05, seed=0,
-                irregular=0.0, murmur=0.0, murmur_shape="plateau"):
+                irregular=0.0, murmur=0.0, murmur_shape="plateau",
+                s3=0.0, s2_split_ms=0.0):
     """合成一段含 S1/S2 的心音,用于离线验证。
 
-    irregular>0: 每拍周期随机抖动(模拟节律不齐)。
-    murmur>0:    收缩期(S1→S2)注入带限噪声(模拟杂音),幅度=该值。
+    irregular>0:  每拍周期随机抖动(模拟节律不齐)。
+    murmur>0:     收缩期(S1→S2)注入带限噪声(模拟杂音),幅度=该值。
     murmur_shape: plateau(平台) / diamond(钻石) / crescendo(递增) / decrescendo(递减)。
+    s3>0:         早舒张期注入低频 S3 奔马律,幅度=该值。
+    s2_split_ms>0: S2 加第二分量(A2-P2 分裂),间隔=该值(毫秒)。
     """
     rng = np.random.default_rng(seed)
     n = int(secs * fs)
@@ -566,6 +678,16 @@ def _synthesize(bpm=72.0, secs=8.0, fs=2000.0, noise=0.05, seed=0,
             idx = (t > tc) & (t < tc + 0.10)
             tau = t[idx] - tc
             x[idx] += amp * np.sin(2 * np.pi * f * tau) * np.exp(-tau / 0.02)
+        if s2_split_ms > 0:        # S2 第二分量(分裂)
+            tc = t2 + s2_split_ms / 1000.0
+            idx = (t > tc) & (t < tc + 0.10)
+            tau = t[idx] - tc
+            x[idx] += 0.5 * np.sin(2 * np.pi * 70 * tau) * np.exp(-tau / 0.02)
+        if s3 > 0:                 # 早舒张期 S3 低频音(~35Hz)
+            tc = t2 + 0.14
+            idx = (t > tc) & (t < tc + 0.08)
+            tau = t[idx] - tc
+            x[idx] += s3 * np.sin(2 * np.pi * 35 * tau) * np.exp(-tau / 0.03)
         if murmur > 0:             # 收缩期湍流噪声(高频),按形状加权
             lo, hi = t1 + 0.04, t2 - 0.03
             sysmask = (t > lo) & (t < hi)
@@ -665,5 +787,31 @@ if __name__ == "__main__":
         ok8 = "钻石" in md.get("shape", "")
         print(f"[8] 杂音形状: 注入钻石型 -> 判定「{md.get('shape')}」"
               f"({md.get('timing')})  " + ("✅" if ok8 else "❌"))
+
+        # 9) S3 奔马律: 注入 S3 后早舒张低频指数应显著高于正常
+        xs3, _ = _synthesize(bpm=72, secs=12, s3=0.5, seed=5)
+        e_n = an.analyze(x, fs)["extra_sounds"]
+        e_s3 = an.analyze(xs3, fs)["extra_sounds"]
+        ok9 = (e_s3["s3"] is not None and e_n["s3"] is not None
+               and e_s3["s3"] > 0.20 and e_s3["s3"] > 2 * e_n["s3"])
+        print(f"[9] S3检测: 正常 s3={e_n['s3']:.3f}  含S3 s3={e_s3['s3']:.3f} "
+              f"-> 「{e_s3['flag']}」  " + ("✅" if ok9 else "❌"))
+
+        # 10) S2 分裂: 注入 50ms 分裂应被估计出来(~50ms)
+        xsp, _ = _synthesize(bpm=72, secs=12, s2_split_ms=50, seed=6)
+        sp = an.analyze(xsp, fs)["s2_split"]
+        ok10 = sp["split_ms"] is not None and abs(sp["split_ms"] - 50) < 20
+        print(f"[10] S2分裂: 注入50ms -> 估计 {sp['split_ms']:.0f}ms "
+              f"(占比{sp.get('split_frac', 0):.0%})  " + ("✅" if ok10 else "❌"))
+
+        # 11) 频域HRV: 短窗应不可用,长记录(≥20拍)应可用并给出 LF/HF
+        h_short = an.analyze(x, fs)["hrv_freq"]
+        xlong, _ = _synthesize(bpm=72, secs=40, irregular=0.06, seed=7)
+        h_long = an.analyze(xlong, fs)["hrv_freq"]
+        ok11 = (not h_short["available"]) and h_long["available"]
+        lfhf = h_long.get("lf_hf")
+        print(f"[11] 频域HRV: 短窗可用={h_short['available']}  "
+              f"长记录可用={h_long['available']} LF/HF="
+              f"{lfhf:.2f}  " + ("✅" if ok11 else "❌"))
     else:
         RealtimeHeartRate().run()
