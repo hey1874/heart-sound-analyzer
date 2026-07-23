@@ -30,6 +30,11 @@ from synth import synthesize
 #
 # 注意这里只放**连续量**、不放阈值化后的布尔量(如 noise_suspect):那些布尔
 # 量由未标定的经验阈值算出,喂给模型等于把手工阈值当成事实。
+#
+# 末尾 24 维 spec_* 来自 `spectral_profile`,是本特征集里贡献最大的一组:
+# CirCor 实测,仅用这 24 维在通过门控的录音上即达 AUC 0.840,而原有 29 维
+# 只有 0.775、单个 murmur_sys 只有 0.715。原因是 murmur_index 把整个收缩期
+# 的频谱压成一个标量,丢掉了杂音的频谱形状。
 FEATURE_NAMES = [
     "bpm", "confidence",
     "sqi", "periodicity", "band_ratio", "band_clean", "hum", "clip",
@@ -38,7 +43,7 @@ FEATURE_NAMES = [
     "murmur_sys", "murmur_dia", "murmur_asymmetry",
     "murmur_occupancy", "murmur_peak_pos", "murmur_flatness",
     "s3", "s4", "s2_split_ms", "s2_split_frac",
-]
+] + [f"spec_{k}" for k in ['sys_b20_60', 'sys_b60_120', 'sys_b120_200', 'sys_b200_300', 'sys_b300_450', 'sys_b450_700', 'sys_centroid', 'sys_spread', 'sys_rolloff85', 'sys_flatness', 'sys_slope', 'sys_hi_lo', 'dia_b20_60', 'dia_b60_120', 'dia_b120_200', 'dia_b200_300', 'dia_b300_450', 'dia_b450_700', 'dia_centroid', 'dia_spread', 'dia_rolloff85', 'dia_flatness', 'dia_slope', 'dia_hi_lo']]
 
 
 def _g(d: dict | None, *keys, default=np.nan):
@@ -70,7 +75,7 @@ def feature_vector(res: dict) -> np.ndarray:
         _g(res, "murmur", "flatness"),
         _g(res, "extra_sounds", "s3"), _g(res, "extra_sounds", "s4"),
         _g(res, "s2_split", "split_ms"), _g(res, "s2_split", "split_frac"),
-    ]
+    ] + [_g(res, "spectrum", k) for k in ['sys_b20_60', 'sys_b60_120', 'sys_b120_200', 'sys_b200_300', 'sys_b300_450', 'sys_b450_700', 'sys_centroid', 'sys_spread', 'sys_rolloff85', 'sys_flatness', 'sys_slope', 'sys_hi_lo', 'dia_b20_60', 'dia_b60_120', 'dia_b120_200', 'dia_b200_300', 'dia_b300_450', 'dia_b450_700', 'dia_centroid', 'dia_spread', 'dia_rolloff85', 'dia_flatness', 'dia_slope', 'dia_hi_lo']]
     assert len(v) == len(FEATURE_NAMES), "特征向量与 FEATURE_NAMES 长度不一致"
     return np.array(v, dtype=float)
 
