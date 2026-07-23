@@ -457,27 +457,34 @@ class HeartSoundAnalyzer:
         加进特征向量后,通过门控的录音上 AUC 升到 **0.840**(仅用这 24 维即可),
         与工程特征合并后 0.838。**没有用任何神经网络。**
 
-        每个心动周期分别算,取各周期的中位数以抗离群。
+        每个心动周期分别算,再用**中位数与 90 分位数**两种方式聚合。
+
+        为什么要两个聚合量:杂音常只在**部分**心动周期清晰可闻(呼吸调制、
+        体位、噪声干扰),中位数会把它冲淡。这本质上是个多示例问题——一条
+        录音阳性当且仅当**存在**含杂音的周期。CirCor 实测(885 条录音):
+        仅中位数 AUC 0.853,加上 90 分位数升到 **0.879**;再加标准差/10 分位
+        则降到 0.874-0.875(维度翻倍但无新信息,反而稀释)。
         """
-        keys = [f"{ph}_{k}" for ph in ("sys", "dia")
-                for k in ([f"b{lo}_{hi}" for lo, hi in self.SPEC_SUBBANDS]
-                          + ["centroid", "spread", "rolloff85",
-                             "flatness", "slope", "hi_lo"])]
+        stats = [f"b{lo}_{hi}" for lo, hi in self.SPEC_SUBBANDS] + [
+            "centroid", "spread", "rolloff85", "flatness", "slope", "hi_lo"]
+        keys = [f"{ph}_{ag}_{k}" for ph in ("sys", "dia")
+                for ag in ("med", "p90") for k in stats]
         if not cycles:
             return dict.fromkeys(keys, None)
         g = max(1, int(0.04 * self.fs))
         vals = []
-        for lo_key, segs in (("sys", [x_band[a + g: s2 - g]
-                                      for a, s2, b in cycles if s2 - g > a + g]),
-                             ("dia", [x_band[s2 + g: b - g]
-                                      for a, s2, b in cycles if b - g > s2 + g])):
+        for segs in ([x_band[a + g: s2 - g] for a, s2, b in cycles
+                      if s2 - g > a + g],
+                     [x_band[s2 + g: b - g] for a, s2, b in cycles
+                      if b - g > s2 + g]):
             if not segs:
-                vals += [None] * (len(self.SPEC_SUBBANDS) + 6)
+                vals += [None] * (2 * len(stats))
                 continue
             d = np.array([self._spectral_descriptors(s) for s in segs], float)
             with np.errstate(all="ignore"):
-                med = np.nanmedian(d, axis=0)
-            vals += [None if not np.isfinite(v) else float(v) for v in med]
+                agg = np.concatenate([np.nanmedian(d, axis=0),
+                                      np.nanpercentile(d, 90, axis=0)])
+            vals += [None if not np.isfinite(v) else float(v) for v in agg]
         return dict(zip(keys, vals))
 
     def systolic_intervals(self, cycles: list[tuple[int, int, int]]) -> dict:

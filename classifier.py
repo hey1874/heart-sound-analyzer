@@ -31,10 +31,13 @@ from synth import synthesize
 # 注意这里只放**连续量**、不放阈值化后的布尔量(如 noise_suspect):那些布尔
 # 量由未标定的经验阈值算出,喂给模型等于把手工阈值当成事实。
 #
-# 末尾 24 维 spec_* 来自 `spectral_profile`,是本特征集里贡献最大的一组:
-# CirCor 实测,仅用这 24 维在通过门控的录音上即达 AUC 0.840,而原有 29 维
-# 只有 0.775、单个 murmur_sys 只有 0.715。原因是 murmur_index 把整个收缩期
-# 的频谱压成一个标量,丢掉了杂音的频谱形状。
+# 末尾 48 维 spec_* 来自 `spectral_profile`,是本特征集里贡献最大的一组。
+# CirCor 实测(885 条录音,按患者分组 5 折):
+#   原有 29 维                        AUC 0.775-0.792
+#   + 频谱轮廓(仅中位数聚合,24 维)    AUC 0.853
+#   + 频谱轮廓(中位+90分位,48 维)     AUC 0.879   ← 当前
+# 原因有两层:murmur_index 把整个收缩期的频谱压成一个标量,丢掉了频谱形状;
+# 而只取各周期中位数又会把"只在部分周期可闻"的杂音冲淡(多示例问题)。
 FEATURE_NAMES = [
     "bpm", "confidence",
     "sqi", "periodicity", "band_ratio", "band_clean", "hum", "clip",
@@ -43,7 +46,7 @@ FEATURE_NAMES = [
     "murmur_sys", "murmur_dia", "murmur_asymmetry",
     "murmur_occupancy", "murmur_peak_pos", "murmur_flatness",
     "s3", "s4", "s2_split_ms", "s2_split_frac",
-] + [f"spec_{k}" for k in ['sys_b20_60', 'sys_b60_120', 'sys_b120_200', 'sys_b200_300', 'sys_b300_450', 'sys_b450_700', 'sys_centroid', 'sys_spread', 'sys_rolloff85', 'sys_flatness', 'sys_slope', 'sys_hi_lo', 'dia_b20_60', 'dia_b60_120', 'dia_b120_200', 'dia_b200_300', 'dia_b300_450', 'dia_b450_700', 'dia_centroid', 'dia_spread', 'dia_rolloff85', 'dia_flatness', 'dia_slope', 'dia_hi_lo']]
+] + [f"spec_{k}" for k in ['sys_med_b20_60', 'sys_med_b60_120', 'sys_med_b120_200', 'sys_med_b200_300', 'sys_med_b300_450', 'sys_med_b450_700', 'sys_med_centroid', 'sys_med_spread', 'sys_med_rolloff85', 'sys_med_flatness', 'sys_med_slope', 'sys_med_hi_lo', 'sys_p90_b20_60', 'sys_p90_b60_120', 'sys_p90_b120_200', 'sys_p90_b200_300', 'sys_p90_b300_450', 'sys_p90_b450_700', 'sys_p90_centroid', 'sys_p90_spread', 'sys_p90_rolloff85', 'sys_p90_flatness', 'sys_p90_slope', 'sys_p90_hi_lo', 'dia_med_b20_60', 'dia_med_b60_120', 'dia_med_b120_200', 'dia_med_b200_300', 'dia_med_b300_450', 'dia_med_b450_700', 'dia_med_centroid', 'dia_med_spread', 'dia_med_rolloff85', 'dia_med_flatness', 'dia_med_slope', 'dia_med_hi_lo', 'dia_p90_b20_60', 'dia_p90_b60_120', 'dia_p90_b120_200', 'dia_p90_b200_300', 'dia_p90_b300_450', 'dia_p90_b450_700', 'dia_p90_centroid', 'dia_p90_spread', 'dia_p90_rolloff85', 'dia_p90_flatness', 'dia_p90_slope', 'dia_p90_hi_lo']]
 
 
 def _g(d: dict | None, *keys, default=np.nan):
@@ -75,7 +78,7 @@ def feature_vector(res: dict) -> np.ndarray:
         _g(res, "murmur", "flatness"),
         _g(res, "extra_sounds", "s3"), _g(res, "extra_sounds", "s4"),
         _g(res, "s2_split", "split_ms"), _g(res, "s2_split", "split_frac"),
-    ] + [_g(res, "spectrum", k) for k in ['sys_b20_60', 'sys_b60_120', 'sys_b120_200', 'sys_b200_300', 'sys_b300_450', 'sys_b450_700', 'sys_centroid', 'sys_spread', 'sys_rolloff85', 'sys_flatness', 'sys_slope', 'sys_hi_lo', 'dia_b20_60', 'dia_b60_120', 'dia_b120_200', 'dia_b200_300', 'dia_b300_450', 'dia_b450_700', 'dia_centroid', 'dia_spread', 'dia_rolloff85', 'dia_flatness', 'dia_slope', 'dia_hi_lo']]
+    ] + [_g(res, "spectrum", k) for k in ['sys_med_b20_60', 'sys_med_b60_120', 'sys_med_b120_200', 'sys_med_b200_300', 'sys_med_b300_450', 'sys_med_b450_700', 'sys_med_centroid', 'sys_med_spread', 'sys_med_rolloff85', 'sys_med_flatness', 'sys_med_slope', 'sys_med_hi_lo', 'sys_p90_b20_60', 'sys_p90_b60_120', 'sys_p90_b120_200', 'sys_p90_b200_300', 'sys_p90_b300_450', 'sys_p90_b450_700', 'sys_p90_centroid', 'sys_p90_spread', 'sys_p90_rolloff85', 'sys_p90_flatness', 'sys_p90_slope', 'sys_p90_hi_lo', 'dia_med_b20_60', 'dia_med_b60_120', 'dia_med_b120_200', 'dia_med_b200_300', 'dia_med_b300_450', 'dia_med_b450_700', 'dia_med_centroid', 'dia_med_spread', 'dia_med_rolloff85', 'dia_med_flatness', 'dia_med_slope', 'dia_med_hi_lo', 'dia_p90_b20_60', 'dia_p90_b60_120', 'dia_p90_b120_200', 'dia_p90_b200_300', 'dia_p90_b300_450', 'dia_p90_b450_700', 'dia_p90_centroid', 'dia_p90_spread', 'dia_p90_rolloff85', 'dia_p90_flatness', 'dia_p90_slope', 'dia_p90_hi_lo']]
     assert len(v) == len(FEATURE_NAMES), "特征向量与 FEATURE_NAMES 长度不一致"
     return np.array(v, dtype=float)
 
