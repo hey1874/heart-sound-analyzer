@@ -4,6 +4,7 @@ train_cnn.py — 在 CirCor 上训练/评估频谱图 CNN 杂音检测器。
 用法:
     python train_cnn.py <CirCor目录> [--cache feats.npz] [--epochs 40]
     python train_cnn.py <CirCor目录> --folds 5        # 按患者分组交叉验证
+    python train_cnn.py <CirCor目录> --save model.pt  # 交叉验证后在全量上重训并保存
 
 评估口径与工程特征基线**完全一致**(docs/VALIDATION.md),便于直接比较:
   - 标签:该听诊区在患者的 `Murmur locations` 里才算阳性;

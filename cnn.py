@@ -127,6 +127,32 @@ def build_model(n_mels: int = N_MELS):
     )
 
 
+def load_model(path: str, device: str = "cpu"):
+    """加载 train_cnn.py --save 存下的模型,返回 (model, meta)。"""
+    import torch
+    d = torch.load(path, map_location=device, weights_only=False)
+    m = build_model()
+    m.load_state_dict(d["state_dict"])
+    m.to(device).eval()
+    return m, d
+
+
+def score_recording(model, x, fs, device: str = "cpu", q: float = 0.8) -> float:
+    """对一条录音打分:切窗 -> 逐窗预测 -> 高分位聚合。"""
+    import torch
+    ws = windows(x, fs)
+    if not ws:
+        return float("nan")
+    T = min(w.shape[1] for w in ws)
+    X = torch.from_numpy(np.stack([w[:, :T] for w in ws]).astype(np.float32))
+    X = X.unsqueeze(1)
+    X = (X - X.mean(dim=(2, 3), keepdim=True)) / (
+        X.std(dim=(2, 3), keepdim=True) + 1e-5)
+    with torch.no_grad():
+        p = torch.sigmoid(model(X.to(device)).squeeze(1)).cpu().numpy()
+    return float(np.quantile(p, q))
+
+
 def augment(batch, rng):
     """SpecAugment 风格增广:频率掩蔽 + 时间掩蔽 + 随机增益。"""
     import torch
