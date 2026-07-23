@@ -320,6 +320,22 @@ class HeartSoundAnalyzer:
         rr = np.diff(s1) / self.fs * 1000.0            # 毫秒
         mean_rr = float(rr.mean())
         cv = float(rr.std() / (mean_rr + 1e-12))
+        # 稳健 CV:用四分位距估标准差(/1.349),对离群 RR 不敏感。
+        #
+        # 为什么需要它:分段 F1 约 0.93,即约 7% 的 S1 检漏/多检,而**每一个
+        # 分段错误都会同时污染两个 RR 间期**,产生一个约两倍或半倍长的离群值。
+        # CV 是二阶统计量,离群值对它的影响远大于对心率中位数的影响——这就是
+        # 为什么分段 F1 0.93 足以支撑心率和间期中位数,却支撑不住变异性指标。
+        #
+        # CirCor 实测(269 条,真值由官方 S1 标注算出):原始 CV 中位 0.082 而
+        # 真值 0.044,三档判读一致率仅 43%;改用稳健 CV 后中位 0.051、
+        # 一致率 65%。
+        #
+        # ⚠️ 代价:稳健估计同样会削掉**真实的**早搏/房颤造成的离群 RR。本模块
+        # 分不清"分段错误"和"心律失常"——两者在 RR 序列上长得一样。因此
+        # cv/cv_robust 都保留在输出里,`ectopic` 计数也一并给出,由使用者判断。
+        q1, q3 = np.percentile(rr, [25, 75])
+        cv_robust = float((q3 - q1) / 1.349 / (np.median(rr) + 1e-12))
         d = np.diff(rr)                                 # 相邻 RR 之差
         sd1 = float(np.std(d) / np.sqrt(2))             # Poincaré 短期变异
         sd2 = float(np.sqrt(max(0.0, 2 * rr.var() - 0.5 * np.var(d))))  # 长期
@@ -331,15 +347,17 @@ class HeartSoundAnalyzer:
         med = np.median(rr)
         ectopic = int(np.sum(np.abs(rr - med) > 0.20 * med))
 
-        if cv < 0.05:
+        # 判读用稳健 CV(见上),原始 cv 一并输出供对照
+        if cv_robust < 0.05:
             cls = "规则"
-        elif cv < 0.12:
+        elif cv_robust < 0.12:
             cls = "轻度不齐(可能为窦性心律不齐,常见且多属正常)"
         else:
-            cls = "明显不规则(建议就医排查早搏/房颤)"
+            cls = "明显不规则(建议就医排查早搏/房颤;也可能是分段不准)"
         return {
             "classification": cls, "n_rr": int(len(rr)),
-            "mean_bpm": 60000.0 / (mean_rr + 1e-12), "cv": cv,
+            "mean_bpm": 60000.0 / (mean_rr + 1e-12),
+            "cv": cv, "cv_robust": cv_robust,
             "sd1_ms": sd1, "sd2_ms": sd2,
             "sdnn_ms": sdnn, "rmssd_ms": rmssd, "pnn50_pct": pnn50,
             "ectopic": ectopic,

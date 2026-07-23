@@ -33,7 +33,7 @@ from synth import synthesize
 FEATURE_NAMES = [
     "bpm", "confidence",
     "sqi", "periodicity", "band_ratio", "band_clean", "hum", "clip",
-    "cv", "sd1_ms", "sd2_ms", "sdnn_ms", "rmssd_ms", "pnn50_pct", "ectopic",
+    "cv", "cv_robust", "sd1_ms", "sd2_ms", "sdnn_ms", "rmssd_ms", "pnn50_pct", "ectopic",
     "systole_ms", "diastole_ms", "sys_dia_ratio",
     "murmur_sys", "murmur_dia", "murmur_asymmetry",
     "murmur_occupancy", "murmur_peak_pos", "murmur_flatness",
@@ -57,7 +57,8 @@ def feature_vector(res: dict) -> np.ndarray:
         _g(res, "sqi", "sqi"), _g(res, "sqi", "periodicity"),
         _g(res, "sqi", "band_ratio"), _g(res, "sqi", "band_clean"),
         _g(res, "sqi", "hum"), _g(res, "sqi", "clip"),
-        _g(res, "rhythm", "cv"), _g(res, "rhythm", "sd1_ms"),
+        _g(res, "rhythm", "cv"), _g(res, "rhythm", "cv_robust"),
+        _g(res, "rhythm", "sd1_ms"),
         _g(res, "rhythm", "sd2_ms"), _g(res, "rhythm", "sdnn_ms"),
         _g(res, "rhythm", "rmssd_ms"), _g(res, "rhythm", "pnn50_pct"),
         _g(res, "rhythm", "ectopic"),

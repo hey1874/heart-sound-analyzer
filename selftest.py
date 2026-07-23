@@ -65,13 +65,13 @@ def _c_bpm_range():
 @check("规则节律")
 def _c_regular():
     r = _analyze(bpm=72.0, secs=12)["rhythm"]
-    return r["cv"] < 0.05, f"CV={r['cv']:.3f} -> {r['classification']}"
+    return r["cv_robust"] < 0.05,         f"稳健CV={r['cv_robust']:.3f}(原始 {r['cv']:.3f})-> {r['classification']}"
 
 
 @check("不规则节律")
 def _c_irregular():
     r = _analyze(bpm=72.0, secs=14, irregular=0.18, seed=1)["rhythm"]
-    return r["cv"] > 0.08, f"CV={r['cv']:.3f} -> {r['classification']}"
+    return r["cv_robust"] > 0.08,         f"稳健CV={r['cv_robust']:.3f}(原始 {r['cv']:.3f})-> {r['classification']}"
 
 
 @check("杂音检出")
