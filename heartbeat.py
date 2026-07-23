@@ -24,6 +24,25 @@ import threading
 import numpy as np
 from scipy import signal
 
+from synth import synthesize
+
+# 向后兼容:旧版本以私有名 `_synthesize` 从本模块导入合成器,现已移到 synth.py。
+_synthesize = synthesize
+
+
+def _movavg(v: np.ndarray, n: int) -> np.ndarray:
+    """滑动平均,边缘用端点值延拓。
+
+    直接 `np.convolve(..., mode="same")` 会在首尾按零补齐,使包络两端被人为
+    压低——在短窗(如 110ms 的 S2 窗)上这会制造出虚假的峰谷。
+    """
+    if n <= 1 or v.size < 2:
+        return v
+    n = min(int(n), v.size)
+    pad = n // 2
+    vp = np.pad(v, pad, mode="edge")
+    return np.convolve(vp, np.ones(n) / n, mode="same")[pad: pad + v.size]
+
 
 # ---------------------------------------------------------------------------
 # 核心算法:与采集无关,只处理一段波形
@@ -37,24 +56,88 @@ class HeartSoundAnalyzer:
     band:        心音带通范围 (低, 高) Hz。
     bpm_range:   合理心率范围 (min, max),用于约束自相关搜索区间。
     env_smooth_ms: 包络平滑窗口(毫秒)。
+
+    判定与门控阈值
+    ------------------------------------------------------------------
+    murmur_thr / extra_thr / split_narrow_ms / split_fixed_iqr_ms
+                                            —— 决定"疑似 XX"的判定;
+    sqi_thr / conf_thr / hum_thr            —— 决定信号是否可采信。
+
+    ⚠️ 这些数字目前是**经验值,未经任何真实心音数据标定**。在标定之前,本类
+    输出的判定文字只能当作提示,不能当作筛查结论。标定方法见
+    docs/ROADMAP.md 阶段 4。作为构造参数暴露,是为了让使用者能按自己的设备
+    与数据集重新标定,而不是改源码里的魔数。
+
+    分段使用**独立的窄带**(seg_band,默认 30-160Hz / 8 阶)而非主带 20-200Hz,
+    以挡住强杂音对 HSMM 发射模型的污染;取值经真实数据 + 合成用例双重扫参
+    选定,见 __init__ 中的对照表。
     """
 
     def __init__(
         self,
         fs_proc: float = 2000.0,
         band: tuple[float, float] = (20.0, 200.0),
+        seg_band: tuple[float, float] = (30.0, 160.0),
+        seg_order: int = 8,
         murmur_band: tuple[float, float] = (150.0, 600.0),
         bpm_range: tuple[float, float] = (40.0, 180.0),
         env_smooth_ms: float = 30.0,
+        murmur_thr: float = 0.15,
+        extra_thr: float = 0.20,
+        # 生理性分裂:呼气 <30ms,吸气末可达 50-60ms。取 45ms 作为"超出生理
+        # 范围"的下限(留出呼气/吸气均值的余量),而非原来的 40ms——40ms 会把
+        # 正常吸气相判成异常。
+        split_narrow_ms: float = 45.0,
+        # 判"固定"的逐周期 IQR 上限:低于此说明分裂几乎不随呼吸变化。
+        split_fixed_iqr_ms: float = 8.0,
+        sqi_thr: float = 0.35,
+        conf_thr: float = 0.30,
+        hum_thr: float = 0.80,
     ) -> None:
         self.fs = float(fs_proc)
         self.band = band
+        self.seg_band = seg_band
         self.murmur_band = murmur_band
         self.bpm_range = bpm_range
+        self.murmur_thr = murmur_thr
+        self.extra_thr = extra_thr
+        self.split_narrow_ms = split_narrow_ms
+        self.split_fixed_iqr_ms = split_fixed_iqr_ms
+        self.sqi_thr = sqi_thr
+        self.conf_thr = conf_thr
+        # 工频硬拒绝门限。定为 0.80 而非更严的值:实测工频幅度 0.1~0.2 时
+        # hum 指标已达 0.43~0.75,但心率估计仍完全正确(72.0/72.2,置信度
+        # 0.85/0.58)——此时拒收是**过度拒绝**,会把好录音挡在门外、逼用户
+        # 去用 --force,反而架空门控。心率真正开始出错(72→109)是在幅度
+        # 0.3~0.5、hum 指标 0.87~0.95 处。中间地带交给综合 SQI 判(它已按
+        # (1-hum) 折算带内占比)。
+        self.hum_thr = hum_thr
         # 带通滤波器用二阶节(SOS)形式,数值更稳定;阶数 4。
         # 低带:提取 S1/S2 心音用于包络/节律。
         self.sos = signal.butter(
             4, [band[0], band[1]], btype="band", fs=self.fs, output="sos"
+        )
+        # 分段专用带:30-160Hz / 8 阶,只留 S1/S2 主能量区并挡住杂音。
+        #
+        # 问题:分段包络原先取自主带 20-200Hz,4 阶巴特沃斯在 200Hz 滚降不够
+        # 陡,**响亮的杂音漏进包络**,把 HSMM 的"心音/间歇"发射模型带偏,
+        # 时相归属判反(舒张期杂音幅度 ≥1.6 时被报成收缩期杂音)。
+        #
+        # 取值是**扫参数选的**,不是拍脑袋。在 274 条 CirCor 真实录音(对官方
+        # S1 标注)与合成强杂音两个指标上同时评估:
+        #
+        #   分段带            真实 F1   合成强杂音判反
+        #   20-200 / 4阶      0.9278    1.6, 2.0, 2.5 全判反
+        #   20-200 / 8阶      0.9310    1.6, 2.0, 2.5 全判反
+        #   25-180 / 6阶      0.9240    2.5 判反
+        #   25-150 / 6阶      0.9230    无
+        #   30-160 / 8阶      0.9310    无            ← 采用
+        #
+        # 关键教训:第一版只把带宽收窄到 25-150/6 阶,合成用例过了,但真实
+        # F1 从 0.9278 掉到 0.9230——**用合成场景的修复换来了真实数据的倒退**。
+        # 真正起作用的是**滚降陡度**(阶数),不是转折频率。
+        self.sos_seg = signal.butter(
+            seg_order, list(seg_band), btype="band", fs=self.fs, output="sos"
         )
         # 高带:杂音(湍流噪声)主要落在这里,用于杂音能量指数。
         hi = min(murmur_band[1], self.fs / 2 * 0.95)
@@ -67,6 +150,30 @@ class HeartSoundAnalyzer:
         )
         self.env_win = max(1, int(env_smooth_ms / 1000.0 * self.fs))
 
+    @classmethod
+    def from_json(cls, path: str, operating_point: str = "youden",
+                  **overrides) -> "HeartSoundAnalyzer":
+        """从 calibrate.py 产出的 thresholds.json 构造已标定的分析器。
+
+        operating_point 选 ROC 上的工作点:
+          "default"  沿用代码里的经验阈值(只做对照用);
+          "youden"   敏感度+特异度之和最大(平衡);
+          "sens80" / "sens90"  保证该敏感度下特异度最优——筛查通常选这类,
+                     因为漏诊比误报贵,但要接受特异度大幅下降。
+        """
+        import json
+        with open(path, encoding="utf-8") as fh:
+            cal = json.load(fh)
+        kw = {}
+        pt = (cal.get("murmur", {}).get("points", {}) or {}).get(operating_point)
+        if pt:
+            kw["murmur_thr"] = float(pt["thr"])
+        kw.update(overrides)
+        an = cls(**kw)
+        an.calibration = cal
+        an.operating_point = operating_point
+        return an
+
     # --- 各步骤(单独暴露,方便调试/可视化) ---------------------------------
 
     def resample(self, x: np.ndarray, fs_in: float) -> np.ndarray:
@@ -77,13 +184,22 @@ class HeartSoundAnalyzer:
         # resample_poly 内部自动用 gcd 约分,44100->1000 即 10/441。
         return signal.resample_poly(x, int(self.fs), int(round(fs_in)))
 
-    def bandpass(self, x: np.ndarray) -> np.ndarray:
-        """零相位带通,保留 S1/S2 能量,去除工频/呼吸/摩擦。"""
-        # sosfiltfilt 需 len(x) > padlen(≈3·(2·n_sections+1));过短则仅去均值。
+    @staticmethod
+    def _filtfilt(sos: np.ndarray, x: np.ndarray) -> np.ndarray:
+        """零相位滤波;信号短于 padlen 时退回去均值。
+
+        统一三条滤波支路的短信号容错。此前 `bandpass` 用 try/except,而
+        `analyze` 里的高/低频带直接调 sosfiltfilt、仅用 `len(xr) > 50` 保护,
+        这个数字与 SOS 的实际 padlen 无关。
+        """
         try:
-            return signal.sosfiltfilt(self.sos, x)
+            return signal.sosfiltfilt(sos, x)
         except ValueError:
             return x - np.mean(x)
+
+    def bandpass(self, x: np.ndarray) -> np.ndarray:
+        """零相位带通,保留 S1/S2 能量,去除工频/呼吸/摩擦。"""
+        return self._filtfilt(self.sos, x)
 
     def shannon_envelope(self, x: np.ndarray) -> np.ndarray:
         """归一化平均香农能量包络(Liang 1997)。
@@ -95,9 +211,7 @@ class HeartSoundAnalyzer:
         xn = x / peak
         s = xn ** 2
         E = -s * np.log(s + 1e-12)
-        # 滑动平均平滑
-        kernel = np.ones(self.env_win) / self.env_win
-        E = np.convolve(E, kernel, mode="same")
+        E = _movavg(E, self.env_win)
         # 标准化:零均值单位方差,便于设阈值/自相关
         E = (E - E.mean()) / (E.std() + 1e-12)
         return E
@@ -107,6 +221,12 @@ class HeartSoundAnalyzer:
 
         返回 (bpm, confidence)。confidence 是该 lag 处的归一化自相关系数
         (~0..1),信号越规律越接近 1;过低时应判定为"不可靠"。
+
+        选峰不能只取搜索区内的最大值。心音包络每个周期含 S1、S2 两个脉冲,
+        自相关在**舒张间期**(S2→下一 S1)处也有峰;该 lag 落在 40-180BPM
+        搜索区内(72BPM 时约 533ms → 112BPM),在干扰下会盖过真周期。
+        真周期的判据是它在 2×lag 处同样有峰,而舒张间期没有——因此对每个
+        候选峰做一次谐波确认后再比较。
         """
         env = env - env.mean()
         ac = signal.correlate(env, env, mode="full")
@@ -120,7 +240,21 @@ class HeartSoundAnalyzer:
             return None, 0.0
 
         seg = ac[lag_min:lag_max + 1]
-        rel = int(np.argmax(seg))
+        peak_rel = int(np.argmax(seg))
+        cand, _ = signal.find_peaks(seg, height=0.5 * seg[peak_rel])
+        cand = sorted(set(cand.tolist()) | {peak_rel})
+
+        def _score(rel: int) -> float:
+            """候选 lag 的谐波确认得分:自身自相关 + 2×lag 处的确认峰。"""
+            lag = rel + lag_min
+            s = float(seg[rel])
+            j = 2 * lag
+            if j < len(ac):                 # 允许 ±5% 周期抖动
+                w = max(1, int(0.05 * lag))
+                s += 0.5 * float(ac[max(0, j - w): min(len(ac), j + w + 1)].max())
+            return s
+
+        rel = max(cand, key=_score)
         lag = rel + lag_min
         conf = float(ac[lag])
 
@@ -223,7 +357,8 @@ class HeartSoundAnalyzer:
         ⚠️ 纯启发式,阈值需按设备标定,假阳/假阴都不少,只作提示。
         """
         if not cycles:
-            return {"systolic": None, "diastolic": None, "flag": "数据不足"}
+            return {"systolic": None, "diastolic": None,
+                    "asymmetry": None, "noise_suspect": None, "flag": "数据不足"}
         e = x_high ** 2                                  # 高频带瞬时能量
         e_lo = x_low ** 2                                # 低频带(心音本体)能量
         g = max(1, int(0.04 * self.fs))                # 避开心音本体的护带
@@ -238,13 +373,33 @@ class HeartSoundAnalyzer:
         sys_idx = float(np.median(sys_e) / ref) if sys_e else None
         dia_idx = float(np.median(dia_e) / ref) if dia_e else None
 
+        # 时相不对称度:环境宽带噪声均匀铺满整个心动周期,收缩期与舒张期的
+        # 高频能量近似相等;真杂音则集中在某一时相。实测 20 段仅加白噪声
+        # (noise=0.25)的正常信号,20 段全部同时报"收缩期+舒张期杂音"——
+        # 这个组合是噪声的指纹,而非病理。以两者的相对差作为判别量。
+        asym, noise_suspect = None, None
+        if sys_idx is not None and dia_idx is not None:
+            asym = float(abs(sys_idx - dia_idx) / (sys_idx + dia_idx + 1e-12))
+            noise_suspect = bool(
+                max(sys_idx, dia_idx) > self.murmur_thr and asym < 0.20
+            )
+
         flags = []
-        if sys_idx is not None and sys_idx > 0.15:
+        if sys_idx is not None and sys_idx > self.murmur_thr:
             flags.append("疑似收缩期杂音")
-        if dia_idx is not None and dia_idx > 0.15:
+        if dia_idx is not None and dia_idx > self.murmur_thr:
             flags.append("疑似舒张期杂音")
+        if noise_suspect:
+            # 不静默抑制,也不过度断言。双期能量接近有三种可能,本模块**分不清**:
+            #   1. 宽带噪声污染(最常见);
+            #   2. 分段不准——杂音响过心音时 HSMM 会被带偏,收缩/舒张窗口错位;
+            #   3. 真的双期升高(连续性杂音如 PDA、狭窄合并反流)。
+            # 因此只陈述观察到的现象和排查方向,把两个数值都留在结果里。
+            flags = ["收缩期与舒张期高频能量接近(不对称度低):"
+                     "可能为宽带噪声污染、分段不准或双期杂音,建议改善采集后复测"]
         return {
             "systolic": sys_idx, "diastolic": dia_idx,
+            "asymmetry": asym, "noise_suspect": noise_suspect,
             "flag": "、".join(flags) if flags else "未见明显杂音",
         }
 
@@ -298,8 +453,14 @@ class HeartSoundAnalyzer:
             env[2 * n // 3:].mean()
         peak_pos = float(np.argmax(env) / n)            # 0(早)..1(晚)
         occupancy = float(np.mean(env > 0.5))           # 高能量占收缩期比例
+        # 平坦度:中间 80% 的变异系数。原判据是 `env.max()-env.min() < 0.5`,
+        # 但 env 已归一化(max 恒为 1),而收缩期两端天然衰减使 min 接近 0,
+        # 该条件恒为假——"全收缩期平台型"这一分支从未触发过(实测平台型杂音
+        # occupancy 已达 0.90,仍被判为"不定形")。
+        core = env[max(1, n // 10): n - max(1, n // 10)] if n >= 10 else env
+        flatness = float(core.std() / (core.mean() + 1e-12))
 
-        if occupancy > 0.7 and (env.max() - env.min()) < 0.5:
+        if occupancy > 0.7 and flatness < 0.25:
             shape = "全收缩期平台型(疑二尖瓣反流/VSD类)"
         elif t2 > t1 * 1.15 and t2 > t3 * 1.15:
             shape = "递增-递减/钻石型(疑主动脉/肺动脉瓣狭窄类)"
@@ -312,8 +473,8 @@ class HeartSoundAnalyzer:
         timing = ("全收缩期" if occupancy > 0.7 else
                   "早收缩期" if peak_pos < 0.33 else
                   "中收缩期" if peak_pos < 0.66 else "晚收缩期")
-        return {"shape": shape, "timing": timing,
-                "peak_pos": peak_pos, "occupancy": occupancy}
+        return {"shape": shape, "timing": timing, "peak_pos": peak_pos,
+                "occupancy": occupancy, "flatness": flatness}
 
     def detect_extra_sounds(
         self, x_low: np.ndarray, cycles: list[tuple[int, int, int]]
@@ -344,9 +505,9 @@ class HeartSoundAnalyzer:
         s3 = float(np.median(s3_vals) / ref) if s3_vals else None
         s4 = float(np.median(s4_vals) / ref) if s4_vals else None
         flags = []
-        if s3 is not None and s3 > 0.20:
+        if s3 is not None and s3 > self.extra_thr:
             flags.append("疑似S3(室性奔马律,见于心衰)")
-        if s4 is not None and s4 > 0.20:
+        if s4 is not None and s4 > self.extra_thr:
             flags.append("疑似S4(房性奔马律)")
         return {"s3": s3, "s4": s4,
                 "flag": "、".join(flags) if flags else "未见明显额外音"}
@@ -357,46 +518,116 @@ class HeartSoundAnalyzer:
         S2 含主动脉瓣(A2)与肺动脉瓣(P2)两个分量,吸气时生理性增宽。
         宽而固定(不随呼吸变化)的分裂提示房间隔缺损(ASD)。
         在每个 S2 窗内对细包络(Hilbert)找两个亚峰,取间隔中位数。
+
+        ⚠️ 此前版本用「高度 > 0.4·峰值 + 最小间隔 15ms」选峰,测到的其实是
+        希尔伯特包络的**纹波**而非 A2-P2:S2 主频约 70Hz,振荡周期 14ms,与
+        15ms 的最小间隔基本重合,导致未注入任何分裂的正常信号也稳定报出
+        18-21ms 的"分裂"(13%-27% 的周期检出双峰)。现改为:
+          - 平滑窗 5ms → 10ms(零点落在 100Hz,压制 70Hz 附近纹波);
+          - 最小间隔 15ms → 20ms(仍远小于 40ms 的宽分裂判据);
+          - 增加**突出度**(prominence)判据——纹波峰骑在主瓣上,突出度很低,
+            这是区分真双峰与纹波的关键;
+          - 取最突出的两个峰而非最靠前的两个。
         """
         if len(s2_idx) == 0:
-            return {"split_ms": None, "flag": "数据不足"}
+            return {"split_ms": None, "split_frac": None, "flag": "数据不足"}
         w = int(0.11 * self.fs)                         # S2 窗 ~110ms
-        sm = max(1, int(0.005 * self.fs))               # ~5ms 轻平滑
-        mind = max(1, int(0.015 * self.fs))             # 两峰最小间隔 ~15ms
-        intervals, double = [], 0
+        sm = max(1, int(0.010 * self.fs))               # ~10ms 平滑
+        mind = max(1, int(0.020 * self.fs))             # 两峰最小间隔 ~20ms
+        intervals, double, usable = [], 0, 0
         for s2 in s2_idx:
             a = int(s2)
             bb = min(len(x_band), a + w)
             if bb - a < int(0.05 * self.fs):
                 continue
-            env = np.abs(signal.hilbert(x_band[a:bb]))
-            env = np.convolve(env, np.ones(sm) / sm, mode="same")
-            pk, _ = signal.find_peaks(env, height=0.4 * env.max(), distance=mind)
+            usable += 1
+            env = _movavg(np.abs(signal.hilbert(x_band[a:bb])), sm)
+            span = float(env.max() - env.min())
+            if span <= 0:
+                continue
+            pk, props = signal.find_peaks(
+                env, height=0.4 * env.max(), distance=mind,
+                prominence=0.20 * span,
+            )
             if len(pk) >= 2:
+                top = pk[np.argsort(props["prominences"])[-2:]]
+                p0, p1 = sorted(int(v) for v in top)
                 double += 1
-                intervals.append((pk[1] - pk[0]) / self.fs * 1000.0)
+                intervals.append((p1 - p0) / self.fs * 1000.0)
+        if not usable:
+            return {"split_ms": None, "split_frac": None,
+                    "split_iqr_ms": None, "flag": "数据不足"}
         if not intervals:
-            return {"split_ms": 0.0, "split_frac": 0.0,
+            return {"split_ms": 0.0, "split_frac": 0.0, "split_iqr_ms": 0.0,
                     "flag": "S2 单一(未见明显分裂)"}
         split = float(np.median(intervals))
-        frac = double / len(s2_idx)
-        if split > 40 and frac > 0.5:
-            flag = "S2 宽分裂(>40ms,若固定不随呼吸变化需排查房间隔缺损)"
-        else:
-            flag = f"S2 分裂(~{split:.0f}ms,生理性多见)"
-        return {"split_ms": split, "split_frac": float(frac), "flag": flag}
+        frac = double / usable
+        # 逐周期离散度。呼吸会周期性调制 A2-P2:吸气时右室回心血量增加、
+        # 肺动脉瓣关闭延后,分裂增宽。所以**正常人的分裂在多个呼吸周期上应有
+        # 明显起伏**,而 ASD 的分裂"固定"——这才是教科书上的鉴别点。
+        iqr = float(np.subtract(*np.percentile(intervals, [75, 25]))) \
+            if len(intervals) >= 4 else None
+        # 记录时长要够覆盖数个呼吸周期(静息 12-20 次/分,一次 3-5 秒)
+        span_s = len(x_band) / self.fs
+        return {"split_ms": split, "split_frac": float(frac),
+                "split_iqr_ms": iqr, "n_split": len(intervals),
+                "flag": self._split_flag(split, frac, iqr, span_s)}
 
-    def hrv_frequency(self, s1: np.ndarray, min_rr: int = 20) -> dict:
+    def _split_flag(self, split: float, frac: float,
+                    iqr: float | None, span_s: float) -> str:
+        """把分裂间期与其呼吸性变异翻译成人话。
+
+        文献依据:生理性分裂呼气时 <30ms,**吸气末可达 50-60ms**;宽分裂约
+        40-50ms。因此单看"宽度 >40ms"会把正常人的吸气相当成异常——本方法原先
+        就是这么做的。真正的鉴别点是**固定性**(不随呼吸变化),而固定性无法
+        从单一宽度值判断。
+
+        本模块没有呼吸相标注,只能用逐周期离散度(IQR)作为呼吸性变异的**代理**:
+        分裂宽、且跨多个呼吸周期几乎不变 → 才提示需要排查 ASD。
+        """
+        if split <= self.split_narrow_ms:
+            return f"S2 分裂(~{split:.0f}ms,在生理范围内)"
+        if frac <= 0.5:
+            return f"S2 分裂(~{split:.0f}ms,仅 {frac:.0%} 的周期检出,证据弱)"
+        if span_s < 15.0:
+            return (f"S2 分裂 ~{split:.0f}ms(偏宽);录音仅 {span_s:.0f}s,"
+                    "不足以覆盖数个呼吸周期,无法判断是否固定")
+        if iqr is None:
+            return f"S2 分裂 ~{split:.0f}ms(偏宽);周期数不足,无法评估变异性"
+        if iqr < self.split_fixed_iqr_ms:
+            return (f"S2 宽分裂 ~{split:.0f}ms 且逐周期变异小"
+                    f"(IQR {iqr:.0f}ms)——符合「固定分裂」形态,"
+                    "建议就医排查房间隔缺损")
+        return (f"S2 分裂 ~{split:.0f}ms(偏宽)但随周期变化"
+                f"(IQR {iqr:.0f}ms),更像生理性呼吸调制")
+
+    def hrv_frequency(
+        self, s1: np.ndarray, min_rr: int = 100, min_secs: float = 120.0
+    ) -> dict:
         """频域 HRV:LF/HF 比(自主神经平衡)。
 
         将 RR 间期序列重采样为均匀 4Hz 心动周期图后做 Welch 谱,
         积分 LF(0.04–0.15Hz)与 HF(0.15–0.40Hz)。
-        ⚠️ 频域 HRV 需较长稳定记录(通常 ≥1–2 分钟),短窗不可靠。
+
+        ⚠️ 门限与文档一致性:此前 `min_rr=20`,在 72BPM 下只需 **18 秒**录音就
+        判"可用",而 LF 下界 0.04Hz 意味着单段至少要 25 秒才谈得上分辨——与
+        docstring 声称的"≥1–2 分钟"矛盾。现按 Task Force 1996 的短时程标准,
+        同时要求 ≥100 个心动周期**且** ≥120 秒。
+
+        异位搏动(早搏)会在 RR 序列上造成尖峰,严重污染频谱,按惯例先用局部
+        中位数替换后再做谱分析,并报告修正了几个。
         """
-        if len(s1) < min_rr + 1:
-            return {"available": False,
-                    "note": f"需 ≥{min_rr} 个心动周期(约 1–2 分钟)才可靠"}
+        if len(s1) < 2:
+            return {"available": False, "note": "心动周期不足"}
         rr = np.diff(s1) / self.fs                       # 秒
+        dur = float(rr.sum())
+        if len(rr) < min_rr or dur < min_secs:
+            return {"available": False,
+                    "note": (f"需 ≥{min_rr} 个心动周期且 ≥{min_secs:.0f} 秒"
+                             f"(当前 {len(rr)} 个 / {dur:.0f} 秒)")}
+        med = float(np.median(rr))
+        ectopic = np.abs(rr - med) > 0.20 * med
+        rr = np.where(ectopic, med, rr)                  # 异位搏动替换为中位数
         t = np.cumsum(rr)
         fs_t = 4.0
         ti = np.arange(0, t[-1], 1.0 / fs_t)
@@ -406,31 +637,95 @@ class HeartSoundAnalyzer:
         lf = float(p[(f >= 0.04) & (f < 0.15)].sum())
         hf = float(p[(f >= 0.15) & (f < 0.40)].sum())
         return {"available": True, "lf": lf, "hf": hf,
-                "lf_hf": float(lf / (hf + 1e-12))}
+                "lf_hf": float(lf / (hf + 1e-12)),
+                "n_rr": int(len(rr)), "duration_s": dur,
+                "ectopic_corrected": int(ectopic.sum())}
 
     # --- 信号质量 SQI:分析前的门控(临床数据处理的标准步骤) ----------------
 
-    def signal_quality(self, x: np.ndarray, conf: float) -> dict:
+    @staticmethod
+    def clip_fraction(x_raw: np.ndarray) -> float:
+        """削波样本比例。**必须在重采样之前**对原始波形计算。
+
+        重采样的抗混叠滤波会把削波平顶磨圆:同一段硬削波信号,以 2000Hz 直接
+        输入时测得 clip=0.027(正确拒绝),以 44kHz 输入(即声卡的实际情况)
+        再重采样后测得 clip=0.000,门控完全失效。
+        """
+        x = np.asarray(x_raw, dtype=np.float64).ravel()
+        # 这是个**相对**度量:任何信号至少有 1 个样本等于最大值,所以比例天然
+        # 不低于 1/N。N ≤ 50 时该下限就已经 ≥0.02(门限),未削波的短信号也会
+        # 被判成削波。短于 200 样本的片段本来就短到无法分析(会先被心率门控
+        # 拦下),直接返回 0 比给一个假阳性更安全。
+        if x.size < 200:
+            return 0.0
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return 0.0
+        mx = float(np.max(np.abs(x)))
+        if mx <= 0:
+            return 0.0
+        return float(np.mean(np.abs(x) >= 0.99 * mx))
+
+    def hum_ratio(self, f: np.ndarray, p: np.ndarray) -> float:
+        """50/60Hz 工频及其谐波贡献的**超出本底**能量,占带内总能量的比例。
+
+        工频落在 20-200Hz 心音带内,所以 band_ratio 遇到工频反而会升高——
+        实测 50Hz 干扰使 band_ratio 从 0.74 升到 1.00、SQI 仍判 ok,而心率
+        已经完全错了。这里单独度量工频线谱,用于抵消 band_ratio 的这一反常。
+
+        工频是**线谱**(1-3 个频点),心音是**瞬态**(谱峰宽约 16Hz),因此以
+        谱线邻域的中位数为本底,只统计超出本底的部分,避免误伤心音本体。
+        """
+        if len(f) < 4:
+            return 0.0
+        in_band = (f >= self.band[0]) & (f <= self.band[1])
+        total = float(p[in_band].sum()) + 1e-20
+        df = float(f[1] - f[0])
+        half = max(df, 1.5)                  # 每根谱线取 ±1.5Hz
+        excess = 0.0
+        for f0 in (50.0, 60.0):
+            for k in range(1, int(self.band[1] // f0) + 1):
+                fc = k * f0
+                if not (self.band[0] <= fc <= self.band[1]):
+                    continue
+                line = np.abs(f - fc) <= half
+                if not line.any():
+                    continue
+                # 本底:谱线两侧 3-10Hz 的中位数
+                side = (np.abs(f - fc) > 3.0) & (np.abs(f - fc) <= 10.0) & in_band
+                base = float(np.median(p[side])) if side.any() else 0.0
+                excess += max(0.0, float(p[line].sum()) - base * int(line.sum()))
+        return float(min(1.0, excess / total))
+
+    def signal_quality(
+        self, x: np.ndarray, conf: float, x_raw: np.ndarray | None = None
+    ) -> dict:
         """估计信号质量指数 SQI(0..1),用于剔除坏段。
 
-        综合三项启发式:
+        综合四项启发式:
           periodicity 周期性(自相关置信度)—— 心音应规律重复;
           band_ratio  带内能量占比 —— 心音能量应集中在 20-200Hz,而非宽带噪声;
-          clip        削波/饱和比例 —— 过载会失真。
-        ⚠️ band_ratio 无法区分 50/60Hz 工频(也落在带内),必要时另加陷波。
+          hum         50/60Hz 工频线谱占比 —— 抵消工频对 band_ratio 的反常抬升;
+          clip        削波/饱和比例 —— 过载会失真(在 x_raw 上算,见 clip_fraction)。
+
+        x 为重采样后的处理波形;x_raw 为原始输入波形(缺省时退回用 x 算削波,
+        此时削波检测在高采样率输入下不可靠)。
         """
         x = np.asarray(x, dtype=np.float64)
-        mx = np.max(np.abs(x)) + 1e-12
-        clip = float(np.mean(np.abs(x) >= 0.99 * mx))
+        clip = self.clip_fraction(x if x_raw is None else x_raw)
         f, p = signal.welch(x, fs=self.fs, nperseg=min(len(x), 2048))
         in_band = (f >= self.band[0]) & (f <= self.band[1])
         band_ratio = float(p[in_band].sum() / (p.sum() + 1e-12))
+        hum = self.hum_ratio(f, p)
         periodicity = float(max(0.0, min(1.0, conf)))
-        sqi = float(0.5 * periodicity + 0.4 * band_ratio + 0.1 * (1 - clip))
+        # 工频占掉的那部分带内能量不算"有效心音能量"
+        band_clean = band_ratio * (1.0 - hum)
+        sqi = float(0.5 * periodicity + 0.4 * band_clean + 0.1 * (1 - clip))
         return {
             "sqi": sqi, "periodicity": periodicity,
-            "band_ratio": band_ratio, "clip": clip,
-            "ok": bool(sqi >= 0.35 and clip < 0.02),
+            "band_ratio": band_ratio, "band_clean": band_clean,
+            "hum": hum, "clip": clip,
+            "ok": bool(sqi >= self.sqi_thr and clip < 0.02 and hum < self.hum_thr),
         }
 
     # --- HSMM-lite 心音分段(时长约束的分段 Viterbi) ------------------------
@@ -512,8 +807,30 @@ class HeartSoundAnalyzer:
         """对一段波形做完整分析,返回结果字典。
 
         screen=True 时额外做信号质量、节律与杂音的筛查级分析(仅提示,非诊断)。
+
+        `res["reliable"]` 汇总"这段结果能不能采信":心率估出来了、置信度够、
+        且 SQI 通过。所有下游(实时输出、predict.py)都应先看这一项——此前
+        实时路径做了置信度门控而 predict.py 完全不做,两条路径的严谨程度不
+        一致,导致低质量录音也会得到一个自信的判定。
         """
+        x = np.asarray(x, dtype=np.float64).ravel()
+        # 空/极短输入直接短路:下游多处要取 max/median,在空数组上会抛
+        # ValueError,而调用方(尤其 predict.py)期望拿到一个结构完整的结果。
+        if x.size < 2:
+            return self._empty_result("输入为空或过短")
+        # 非有限值(NaN/inf)会经 FFT 卷积污染整段结果,且只发出一条
+        # RuntimeWarning 就继续算下去,最终得到全 NaN 的"结果"。损坏的音频
+        # 文件、某些解码器都可能产生。少量则置零后继续,大量则判定为坏数据。
+        finite = np.isfinite(x)
+        if not finite.all():
+            n_bad = int((~finite).sum())
+            if n_bad > 0.01 * x.size:
+                return self._empty_result(
+                    f"输入含 {n_bad}/{x.size} 个非有限值(NaN/inf),超过 1%")
+            x = np.where(finite, x, 0.0)
         xr = self.resample(x, fs_in)
+        if xr.size < 2:
+            return self._empty_result("重采样后过短")
         xb = self.bandpass(xr)
         env = self.shannon_envelope(xb)
         bpm, conf = self.estimate_bpm(env)
@@ -523,34 +840,77 @@ class HeartSoundAnalyzer:
             "confidence": conf,         # 0..1,建议 >0.3 才采信
             "n_beats": int(len(beats)), # 窗口内检测到的心音数
             "beats": beats,             # 峰索引(基于 fs_proc)
-            "env": env,                 # 包络(可视化用)
+            "env": env,                 # 主带包络(心率/可视化用)
+            "env_seg": None,            # 分段专用窄带包络(见 sos_seg)
             "filtered": xb,             # 滤波后波形(可视化用)
             "fs_proc": self.fs,
             "sqi": None, "rhythm": None, "sti": None, "murmur": None,
             "extra_sounds": None, "s2_split": None, "hrv_freq": None,
+            "reliable": False, "unreliable_reason": None,
         }
         if screen:
-            res["sqi"] = self.signal_quality(xr, conf)
-            # 优先用 HSMM 分段;失败(段数过少)回退到启发式
-            s1, s2 = self.segment_hsmm(env, bpm)
+            # 削波必须在重采样前的原始波形上判定,见 clip_fraction
+            res["sqi"] = self.signal_quality(xr, conf, x_raw=x)
+            # 分段用**更窄的低带**包络,避免强杂音漏进来带偏 HSMM(见 sos_seg)
+            env_seg = self.shannon_envelope(self._filtfilt(self.sos_seg, xr))
+            res["env_seg"] = env_seg      # 暴露出来,便于外部复现分段结果
+            s1, s2 = self.segment_hsmm(env_seg, bpm)
             if len(s1) < 3:
-                s1, s2 = self.segment_s1s2(beats)
+                s1, s2 = self.segment_s1s2(self.detect_beats(env_seg))
             cyc = self._cycles(s1, s2)
             res["rhythm"] = self.analyze_rhythm(s1)
             res["sti"] = self.systolic_intervals(cyc)
             res["hrv_freq"] = self.hrv_frequency(s1)
-            x_high = signal.sosfiltfilt(self.sos_murmur, xr) \
-                if len(xr) > 50 else xr
+            x_high = self._filtfilt(self.sos_murmur, xr)
             mu = self.murmur_index(x_high, xb, cyc)
-            # 仅在疑似收缩期杂音时进一步做形状/时相分类
-            if mu.get("systolic") and mu["systolic"] > 0.15:
-                mu.update(self.murmur_shape(x_high, cyc))
+            # 形状/时相**无条件**计算。此前只在 systolic>阈值 时才算,导致
+            # occupancy/peak_pos 在正常样本上 100% 缺失、异常样本上仅 15% 缺失
+            # ——"是否缺失"本身成了标签的代理,树模型可零成本作弊(实测仅凭
+            # 这一个缺失指示位即可达到 92.5% 准确率)。
+            mu.update(self.murmur_shape(x_high, cyc))
             res["murmur"] = mu
-            x_low = signal.sosfiltfilt(self.sos_low, xr) \
-                if len(xr) > 50 else xr
+            x_low = self._filtfilt(self.sos_low, xr)
             res["extra_sounds"] = self.detect_extra_sounds(x_low, cyc)
             res["s2_split"] = self.detect_s2_split(xb, s2)
+            res["reliable"], res["unreliable_reason"] = self._reliability(res)
         return res
+
+    def _empty_result(self, reason: str) -> dict:
+        """结构与 analyze() 一致的"数据不足"结果,便于调用方统一处理。"""
+        return {
+            "bpm": None, "confidence": 0.0, "n_beats": 0,
+            "beats": np.array([], dtype=int),
+            "env": np.array([]), "env_seg": np.array([]),
+            "filtered": np.array([]),
+            "fs_proc": self.fs,
+            "sqi": None, "rhythm": None, "sti": None, "murmur": None,
+            "extra_sounds": None, "s2_split": None, "hrv_freq": None,
+            "reliable": False, "unreliable_reason": reason,
+        }
+
+    def _reliability(self, res: dict) -> tuple[bool, str | None]:
+        """汇总可采信性,并给出人能看懂的失败原因(用于提示如何改善采集)。
+
+        ⚠️ `band_ratio` 只用来**解释**原因,不能单独作为拒绝判据:响亮的杂音
+        本身就有大量能量落在 150-600Hz(20-200Hz 带外),会把 band_ratio 压到
+        0.22 左右。若拿它硬性拒绝,最该被检出的病例反而先被挡在门外。
+        它对质量的贡献已经通过 0.4 的权重体现在综合 SQI 里了。
+        """
+        sqi = res.get("sqi") or {}
+        if res.get("bpm") is None:
+            return False, "录音过短或无法估计心率"
+        # 硬缺陷:与病理无关,只可能是采集问题
+        if sqi.get("clip", 0.0) >= 0.02:
+            return False, "削波/过载(调低输入增益)"
+        if sqi.get("hum", 0.0) >= self.hum_thr:
+            return False, "工频干扰(检查屏蔽/接地,或改用电池供电)"
+        if res.get("confidence", 0.0) < self.conf_thr:
+            return False, "心音不规律或信号弱(调整听诊器位置、压紧)"
+        if not sqi.get("ok", False):
+            why = ("环境噪声/摩擦音偏大" if sqi.get("band_ratio", 1.0) < 0.30
+                   else "周期性差")
+            return False, f"信号质量不足(SQI {sqi.get('sqi', 0):.2f},{why})"
+        return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +932,8 @@ class RealtimeHeartRate:
         self.window_s = window_s
         self.hop_s = hop_s
         self.conf_gate = conf_gate
-        self.analyzer = HeartSoundAnalyzer()
+        # 门控逻辑统一由 analyzer 持有,避免实时路径与 predict.py 各写一套
+        self.analyzer = HeartSoundAnalyzer(conf_thr=conf_gate)
 
     def run(self) -> None:
         import sounddevice as sd  # 延迟导入,核心算法本身不依赖它
@@ -580,21 +941,35 @@ class RealtimeHeartRate:
         info = sd.query_devices(self.device, "input")
         fs = int(self.samplerate or info["default_samplerate"])
         win_n = int(self.window_s * fs)
+        # 索引式环形缓冲:写指针推进,只拷贝新到的那一块。
+        # 此前用 np.roll 整体搬移,每次回调都要新分配并拷贝整个窗口
+        # (44.1kHz/6s 实测 313µs,占 512 样本回调预算的 2.7%),
+        # 而且在音频回调线程里做分配本身就是实时音频的忌讳。
         ring = np.zeros(win_n, dtype=np.float32)
+        widx = 0                       # 下一个写入位置
         filled = 0
         since_hop = 0
+        xruns = 0                      # 回调内不做 I/O,只累计,由主线程报告
         hop_n = int(self.hop_s * fs)
         lock = threading.Lock()        # 音频回调线程与主线程共享缓冲,需互斥
 
         def callback(indata, frames, time_info, status):
-            nonlocal ring, filled, since_hop
+            nonlocal widx, filled, since_hop, xruns
             if status:
-                print("⚠️", status, flush=True)
-            block = indata[:, 0]  # 取单声道
+                xruns += 1
+            block = indata[:, 0]       # 取单声道
+            if len(block) >= win_n:    # 块比窗口还长时只保留最新的一窗
+                block = block[-win_n:]
             n = len(block)
             with lock:
-                ring = np.roll(ring, -n)
-                ring[-n:] = block
+                end = widx + n
+                if end <= win_n:
+                    ring[widx:end] = block
+                else:                  # 跨越缓冲末端,分两段写
+                    k = win_n - widx
+                    ring[widx:] = block[:k]
+                    ring[:end - win_n] = block[k:]
+                widx = end % win_n
                 filled = min(win_n, filled + n)
                 since_hop += n
 
@@ -606,13 +981,20 @@ class RealtimeHeartRate:
             dtype="float32", callback=callback,
         ):
             try:
+                reported_xruns = 0
                 while True:
                     sd.sleep(int(self.hop_s * 1000))
                     with lock:         # 在锁内取快照并复位计数,锁外再做分析
                         ready = since_hop >= hop_n and filled >= win_n
                         if ready:
-                            snapshot = ring.copy()
+                            # 按时间顺序展开环形缓冲(分配发生在主线程)
+                            snapshot = np.concatenate((ring[widx:], ring[:widx]))
                             since_hop = 0
+                        n_xrun = xruns
+                    if n_xrun > reported_xruns:
+                        print(f"⚠️  音频溢出/欠载 ×{n_xrun - reported_xruns}",
+                              flush=True)
+                        reported_xruns = n_xrun
                     if not ready:
                         continue
                     self._report(self.analyzer.analyze(snapshot, fs))
@@ -620,198 +1002,62 @@ class RealtimeHeartRate:
                 print("\n已停止。")
 
     def _report(self, res: dict) -> None:
-        bpm, conf = res["bpm"], res["confidence"]
         sqi = res.get("sqi") or {}
-        if bpm is None or conf < self.conf_gate or sqi.get("ok") is False:
-            bar = "·" * 20
-            why = "削波/过载" if sqi.get("clip", 0) >= 0.02 else \
-                  ("噪声大" if sqi.get("band_ratio", 1) < 0.3 else "不规律")
-            print(f"[{bar}] 信号不清 ({why}, SQI {sqi.get('sqi', 0):.2f}) "
-                  f"— 调整听诊器位置/保持安静", flush=True)
+        if not res.get("reliable"):
+            reason = res.get("unreliable_reason") or "信号不清"
+            print(f"[{'·' * 20}] 信号不清({reason},SQI {sqi.get('sqi', 0):.2f})",
+                  flush=True)
             return
-        filled = int(round(conf * 20))
-        bar = "█" * filled + "·" * (20 - filled)
-        line = (f"[{bar}] {bpm:5.1f} BPM   置信度 {conf:4.2f}   "
-                f"窗内心音 {res['n_beats']}")
-        rh, mu = res.get("rhythm"), res.get("murmur")
-        if rh and rh.get("n_rr", 0) >= 3:
-            line += f"   节律:{rh['classification']}"
+        bpm, conf = res["bpm"], res["confidence"]
+        n = int(round(conf * 20))
+        parts = [f"[{'█' * n + '·' * (20 - n)}] {bpm:5.1f} BPM",
+                 f"置信度 {conf:4.2f}", f"窗内心音 {res['n_beats']}"]
+
+        rh = res.get("rhythm") or {}
+        if rh.get("n_rr", 0) >= 3:
+            s = f"节律:{rh['classification']}"
             if rh.get("ectopic"):
-                line += f"(早搏{rh['ectopic']})"
-        if mu and mu.get("flag") not in (None, "数据不足"):
-            line += f"   杂音:{mu['flag']}"
-            if mu.get("shape"):     # 疑似杂音时附形状/时相
-                line += f"({mu['shape']}/{mu['timing']})"
-        ex = res.get("extra_sounds")
-        if ex and ex.get("flag") not in (None, "数据不足", "未见明显额外音"):
-            line += f"   {ex['flag']}"
-        sp = res.get("s2_split")
-        if sp and sp.get("split_ms", 0) and sp["split_ms"] > 40:
-            line += f"   {sp['flag']}"
-        print(line, flush=True)
+                s += f"(早搏{rh['ectopic']})"
+            parts.append(s)
+
+        mu = res.get("murmur") or {}
+        if mu.get("flag") not in (None, "数据不足", "未见明显杂音"):
+            s = f"杂音:{mu['flag']}"
+            # 形状/时相现在无条件计算(避免特征缺失泄漏),但只在**收缩期**窗口
+            # 上有意义,故仅在确实疑似收缩期杂音、且不像噪声时才展示。
+            if ("收缩期杂音" in mu["flag"] and not mu.get("noise_suspect")
+                    and mu.get("shape") not in (None, "数据不足", "不定形")):
+                s += f"({mu['shape']}/{mu['timing']})"
+            parts.append(s)
+
+        ex = res.get("extra_sounds") or {}
+        if ex.get("flag") not in (None, "数据不足", "未见明显额外音"):
+            parts.append(ex["flag"])
+
+        sp = res.get("s2_split") or {}
+        if (sp.get("split_ms") or 0) > self.analyzer.split_narrow_ms:
+            parts.append(sp["flag"])
+
+        print("   ".join(parts), flush=True)
 
 
 # ---------------------------------------------------------------------------
-# 自测:无麦克风时用合成心音验证算法正确性
+# 命令行入口
 # ---------------------------------------------------------------------------
-def _synthesize(bpm=72.0, secs=8.0, fs=2000.0, noise=0.05, seed=0,
-                irregular=0.0, murmur=0.0, murmur_shape="plateau",
-                s3=0.0, s2_split_ms=0.0):
-    """合成一段含 S1/S2 的心音,用于离线验证。
-
-    irregular>0:  每拍周期随机抖动(模拟节律不齐)。
-    murmur>0:     收缩期(S1→S2)注入带限噪声(模拟杂音),幅度=该值。
-    murmur_shape: plateau(平台) / diamond(钻石) / crescendo(递增) / decrescendo(递减)。
-    s3>0:         早舒张期注入低频 S3 奔马律,幅度=该值。
-    s2_split_ms>0: S2 加第二分量(A2-P2 分裂),间隔=该值(毫秒)。
-    """
-    rng = np.random.default_rng(seed)
-    n = int(secs * fs)
-    t = np.arange(n) / fs
-    x = np.zeros(n)
-    hp = signal.butter(4, [200, 600], "band", fs=fs, output="sos")
-    base = 60.0 / bpm
-    t1 = 0.0
-    while t1 < secs:
-        t2 = t1 + 0.30             # S2 "dub",收缩期约 0.3s
-        for tc, amp, f in ((t1, 1.0, 50.0), (t2, 0.6, 70.0)):
-            idx = (t > tc) & (t < tc + 0.10)
-            tau = t[idx] - tc
-            x[idx] += amp * np.sin(2 * np.pi * f * tau) * np.exp(-tau / 0.02)
-        if s2_split_ms > 0:        # S2 第二分量(分裂)
-            tc = t2 + s2_split_ms / 1000.0
-            idx = (t > tc) & (t < tc + 0.10)
-            tau = t[idx] - tc
-            x[idx] += 0.5 * np.sin(2 * np.pi * 70 * tau) * np.exp(-tau / 0.02)
-        if s3 > 0:                 # 早舒张期 S3 低频音(~35Hz)
-            tc = t2 + 0.14
-            idx = (t > tc) & (t < tc + 0.08)
-            tau = t[idx] - tc
-            x[idx] += s3 * np.sin(2 * np.pi * 35 * tau) * np.exp(-tau / 0.03)
-        if murmur > 0:             # 收缩期湍流噪声(高频),按形状加权
-            lo, hi = t1 + 0.04, t2 - 0.03
-            sysmask = (t > lo) & (t < hi)
-            p = (t[sysmask] - lo) / (hi - lo)          # 收缩期内相对位置 0..1
-            if murmur_shape == "crescendo":
-                w = p
-            elif murmur_shape == "decrescendo":
-                w = 1 - p
-            elif murmur_shape == "diamond":
-                w = 1 - np.abs(2 * p - 1)              # 中间高两端低
-            else:                                       # plateau
-                w = np.ones_like(p)
-            burst = signal.sosfilt(hp, rng.standard_normal(n))
-            x[sysmask] += murmur * w * burst[sysmask]
-        period = base * (1.0 + irregular * rng.standard_normal())
-        t1 += max(0.3, period)     # 防止周期过短
-    x += noise * rng.standard_normal(n)
-    return x, fs
-
-
 if __name__ == "__main__":
     import sys
 
     # Windows 控制台默认 GBK,统一切到 UTF-8 避免 emoji/中文报错
-    try:
+    try:   # Windows 控制台默认 GBK;stderr 也要一起切,否则报错信息乱码
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
     if "--selftest" in sys.argv:
-        an = HeartSoundAnalyzer()
-
-        # 1) 心率精度
-        true_bpm = 72.0
-        x, fs = _synthesize(bpm=true_bpm, secs=12)
-        r = an.analyze(x, fs)
-        err = abs(r["bpm"] - true_bpm)
-        print(f"[1] 心率: 真值 {true_bpm} -> 估计 {r['bpm']:.1f} BPM "
-              f"(置信度 {r['confidence']:.2f})  "
-              + ("✅" if err < 3 else f"❌ 误差 {err:.1f}"))
-
-        # 2) 规则节律应判"规则"
-        r2 = an.analyze(x, fs)["rhythm"]
-        print(f"[2] 规则节律: CV={r2['cv']:.3f} -> {r2['classification']}  "
-              + ("✅" if r2["cv"] < 0.05 else "❌"))
-
-        # 3) 不规则节律应判 CV 偏大
-        xi, _ = _synthesize(bpm=72, secs=14, irregular=0.18, seed=1)
-        r3 = an.analyze(xi, fs)["rhythm"]
-        print(f"[3] 不规则节律: CV={r3['cv']:.3f} -> {r3['classification']}  "
-              + ("✅" if r3["cv"] > 0.08 else "❌"))
-
-        # 4) 杂音检出:有杂音的收缩期指数应明显高于正常
-        xm, _ = _synthesize(bpm=72, secs=12, murmur=0.5, seed=2)
-        mu_n = an.analyze(x, fs)["murmur"]["systolic"]
-        mu_m = an.analyze(xm, fs)["murmur"]["systolic"]
-        ok = (mu_n is not None and mu_m is not None and mu_m > 3 * mu_n)
-        print(f"[4] 杂音指数: 正常={mu_n:.3f}  含杂音={mu_m:.3f}  "
-              + ("✅" if ok else "❌"))
-
-        # 5) HSMM 分段: S1 起点应对齐真实心跳(周期 T 的整数倍)
-        rh = an.analyze(x, fs)
-        s1, _ = an.segment_hsmm(rh["env"], rh["bpm"])
-        T = 60.0 / true_bpm
-        if len(s1) >= 4:
-            t_s1 = np.sort(s1) / fs
-            # 与最近的真实 S1 时刻(k*T)对齐,统计相位误差
-            phase_err = np.mean(np.abs(((t_s1 - t_s1[0] + T / 2) % T) - T / 2))
-            ok5 = phase_err < 0.05
-        else:
-            phase_err, ok5 = 9.9, False
-        print(f"[5] HSMM分段: 检出 {len(s1)} 个 S1, 相位误差 {phase_err*1000:.0f}ms  "
-              + ("✅" if ok5 else "❌"))
-
-        # 6) SQI: 干净信号应判 ok,强噪声应判 not ok
-        xn, _ = _synthesize(bpm=72, secs=12, noise=2.0, seed=3)
-        q_ok = an.analyze(x, fs)["sqi"]
-        q_bad = an.analyze(xn, fs)["sqi"]
-        ok6 = q_ok["ok"] and not q_bad["ok"]
-        print(f"[6] SQI门控: 干净 SQI={q_ok['sqi']:.2f}(ok={q_ok['ok']})  "
-              f"噪声 SQI={q_bad['sqi']:.2f}(ok={q_bad['ok']})  "
-              + ("✅" if ok6 else "❌"))
-
-        # 7) STI: 合成收缩期 0.30s,估计应接近;且收缩<舒张
-        sti = an.analyze(x, fs)["sti"]
-        ok7 = (sti["systole_ms"] is not None
-               and abs(sti["systole_ms"] - 300) < 40
-               and sti["sys_dia_ratio"] < 1.0)
-        print(f"[7] STI: 收缩期≈{sti['systole_ms']:.0f}ms 舒张期≈"
-              f"{sti['diastole_ms']:.0f}ms 比值={sti['sys_dia_ratio']:.2f}  "
-              + ("✅" if ok7 else "❌"))
-
-        # 8) 杂音形状: 注入钻石型应判为"递增-递减/钻石型"
-        xd, _ = _synthesize(bpm=72, secs=12, murmur=0.6,
-                            murmur_shape="diamond", seed=4)
-        md = an.analyze(xd, fs)["murmur"]
-        ok8 = "钻石" in md.get("shape", "")
-        print(f"[8] 杂音形状: 注入钻石型 -> 判定「{md.get('shape')}」"
-              f"({md.get('timing')})  " + ("✅" if ok8 else "❌"))
-
-        # 9) S3 奔马律: 注入 S3 后早舒张低频指数应显著高于正常
-        xs3, _ = _synthesize(bpm=72, secs=12, s3=0.5, seed=5)
-        e_n = an.analyze(x, fs)["extra_sounds"]
-        e_s3 = an.analyze(xs3, fs)["extra_sounds"]
-        ok9 = (e_s3["s3"] is not None and e_n["s3"] is not None
-               and e_s3["s3"] > 0.20 and e_s3["s3"] > 2 * e_n["s3"])
-        print(f"[9] S3检测: 正常 s3={e_n['s3']:.3f}  含S3 s3={e_s3['s3']:.3f} "
-              f"-> 「{e_s3['flag']}」  " + ("✅" if ok9 else "❌"))
-
-        # 10) S2 分裂: 注入 50ms 分裂应被估计出来(~50ms)
-        xsp, _ = _synthesize(bpm=72, secs=12, s2_split_ms=50, seed=6)
-        sp = an.analyze(xsp, fs)["s2_split"]
-        ok10 = sp["split_ms"] is not None and abs(sp["split_ms"] - 50) < 20
-        print(f"[10] S2分裂: 注入50ms -> 估计 {sp['split_ms']:.0f}ms "
-              f"(占比{sp.get('split_frac', 0):.0%})  " + ("✅" if ok10 else "❌"))
-
-        # 11) 频域HRV: 短窗应不可用,长记录(≥20拍)应可用并给出 LF/HF
-        h_short = an.analyze(x, fs)["hrv_freq"]
-        xlong, _ = _synthesize(bpm=72, secs=40, irregular=0.06, seed=7)
-        h_long = an.analyze(xlong, fs)["hrv_freq"]
-        ok11 = (not h_short["available"]) and h_long["available"]
-        lfhf = h_long.get("lf_hf")
-        print(f"[11] 频域HRV: 短窗可用={h_short['available']}  "
-              f"长记录可用={h_long['available']} LF/HF="
-              f"{lfhf:.2f}  " + ("✅" if ok11 else "❌"))
+        # 自测已移到 selftest.py:原来的内联版本无论成败都返回退出码 0,
+        # 无法接入 CI;现在按失败数返回非零退出码,并被 tests/ 复用。
+        from selftest import main
+        sys.exit(main())
     else:
         RealtimeHeartRate().run()

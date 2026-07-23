@@ -11,3 +11,6 @@ joblib>=1.2
 
 # 读取音频文件(predict.py 处理 wav / PhysioNet 加载)
 soundfile>=0.12
+
+# 测试(可选;selftest.py 本身只需 numpy+scipy)
+pytest>=7.0

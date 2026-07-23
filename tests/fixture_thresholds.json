@@ -1,0 +1,144 @@
+{
+  "dataset": "C:\\Users\\t\\AppData\\Local\\Temp\\claude\\D--eee\\e87a4787-d20b-426f-a692-2f474b138543\\scratchpad\\circor_std",
+  "n_recordings": 601,
+  "n_patients": 180,
+  "feature_names": [
+    "bpm",
+    "confidence",
+    "sqi",
+    "periodicity",
+    "band_ratio",
+    "band_clean",
+    "hum",
+    "clip",
+    "cv",
+    "sd1_ms",
+    "sd2_ms",
+    "sdnn_ms",
+    "rmssd_ms",
+    "pnn50_pct",
+    "ectopic",
+    "systole_ms",
+    "diastole_ms",
+    "sys_dia_ratio",
+    "murmur_sys",
+    "murmur_dia",
+    "murmur_asymmetry",
+    "murmur_occupancy",
+    "murmur_peak_pos",
+    "murmur_flatness",
+    "s3",
+    "s4",
+    "s2_split_ms",
+    "s2_split_frac"
+  ],
+  "conf_thr_tradeoff": [
+    {
+      "conf_thr": 0.0,
+      "keep": 1.0,
+      "median_err": 2.3406483224249044,
+      "gross_err": 0.23333333333333334
+    },
+    {
+      "conf_thr": 0.1,
+      "keep": 0.9233333333333333,
+      "median_err": 2.138318665689333,
+      "gross_err": 0.1967509025270758
+    },
+    {
+      "conf_thr": 0.15,
+      "keep": 0.82,
+      "median_err": 1.9056589162979378,
+      "gross_err": 0.15447154471544716
+    },
+    {
+      "conf_thr": 0.2,
+      "keep": 0.6916666666666667,
+      "median_err": 1.6167326601147636,
+      "gross_err": 0.13734939759036144
+    },
+    {
+      "conf_thr": 0.25,
+      "keep": 0.565,
+      "median_err": 1.4132311964736601,
+      "gross_err": 0.0943952802359882
+    },
+    {
+      "conf_thr": 0.3,
+      "keep": 0.4716666666666667,
+      "median_err": 1.212625653676625,
+      "gross_err": 0.045936395759717315
+    },
+    {
+      "conf_thr": 0.35,
+      "keep": 0.3883333333333333,
+      "median_err": 1.1457780355546276,
+      "gross_err": 0.02145922746781116
+    },
+    {
+      "conf_thr": 0.4,
+      "keep": 0.315,
+      "median_err": 1.1216899332411572,
+      "gross_err": 0.010582010582010581
+    },
+    {
+      "conf_thr": 0.5,
+      "keep": 0.20333333333333334,
+      "median_err": 1.0149545336411876,
+      "gross_err": 0.0
+    }
+  ],
+  "segmentation": {
+    "sensitivity": 0.9362654727416382,
+    "ppv": 0.92578125,
+    "f1": 0.9309938457509493,
+    "median_err_ms": 0.3260000000011587,
+    "n_recordings": 274,
+    "n_s1": 7594
+  },
+  "murmur": {
+    "auc": 0.714928491081472,
+    "n_pos": 147,
+    "n_neg": 127,
+    "points": {
+      "default": {
+        "thr": 0.15,
+        "sens": 0.3401360544217687,
+        "spec": 0.9133858267716536
+      },
+      "youden": {
+        "thr": 0.04104809459130098,
+        "sens": 0.673469387755102,
+        "spec": 0.6692913385826772
+      },
+      "sens80": {
+        "thr": 0.017984694696157467,
+        "sens": 0.8027210884353742,
+        "spec": 0.4251968503937008
+      },
+      "sens90": {
+        "thr": 0.009954455451647406,
+        "sens": 0.9047619047619048,
+        "spec": 0.25196850393700787
+      }
+    }
+  },
+  "ml": {
+    "全部录音": {
+      "grouped_auc": 0.7680564506897827,
+      "grouped_bacc": 0.6959030411485764,
+      "ungrouped_auc": 0.8019050812813389,
+      "leak": 0.033848630591556184,
+      "baseline_acc": 0.6605657237936772,
+      "n": 601
+    },
+    "仅通过门控": {
+      "grouped_auc": 0.7931500942835276,
+      "grouped_bacc": 0.7245296078234609,
+      "ungrouped_auc": 0.805192572944297,
+      "leak": 0.012042478660769462,
+      "baseline_acc": 0.6715328467153284,
+      "n": 274
+    }
+  }
+}

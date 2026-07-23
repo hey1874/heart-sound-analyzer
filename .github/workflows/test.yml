@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # 核心算法与测试不需要 sounddevice(它要系统级 PortAudio),单独装依赖
+      - run: pip install numpy scipy scikit-learn joblib pytest
+      - name: 自测(失败返回非零退出码)
+        run: python selftest.py
+      - name: pytest
+        run: python -m pytest tests/ -q
