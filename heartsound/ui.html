@@ -48,20 +48,29 @@ body{background:var(--bg);color:var(--fg);font:15px/1.7 var(--sans);
 @keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
 @media (prefers-reduced-motion:reduce){.pip.live{animation:none}}
 
-.site{display:grid;grid-template-columns:190px 1fr;gap:22px;align-items:start;
+.site{display:grid;grid-template-columns:230px 1fr;gap:22px;align-items:start;
       background:var(--card);border:1px solid var(--line);border-radius:10px;
       padding:16px 18px;margin-bottom:16px}
 @media(max-width:640px){.site{grid-template-columns:1fr}}
 .torso{width:100%;height:auto;display:block}
-.torso .body{fill:var(--track);stroke:var(--line);stroke-width:1.5}
-.torso .sternum{stroke:var(--line);stroke-width:1.5;stroke-dasharray:4 4}
-.torso .dot{fill:var(--card);stroke:var(--fg-3);stroke-width:1.8;cursor:pointer}
+.torso .body{fill:var(--track);stroke:var(--line);stroke-width:1.6}
+.torso .neck{fill:var(--track);stroke:var(--line);stroke-width:1.4}
+.torso .heart{fill:var(--bad);opacity:.10}
+.torso .clav{fill:none;stroke:var(--fg-3);stroke-width:2.6;stroke-linecap:round;opacity:.5}
+.torso .rib{fill:none;stroke:var(--fg-3);stroke-width:1.3;opacity:.42}
+.torso .sternum{fill:var(--card);stroke:var(--fg-3);stroke-width:1.4;opacity:.9}
+.torso .angle{stroke:var(--fg-2);stroke-width:1.6}
+.torso .mcl{stroke:var(--fg-3);stroke-width:1;stroke-dasharray:3 4;opacity:.7}
+.torso .key-lbl{font:8.5px var(--sans);fill:var(--fg-2)}
+.torso .halo{fill:var(--accent);opacity:.16}
+.torso .dot{fill:var(--card);stroke:var(--fg-2);stroke-width:2;cursor:pointer;
+            transition:r .15s ease}
 .torso .dot.on{fill:var(--accent);stroke:var(--accent)}
 .torso .dot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .torso .lbl{font:600 9px var(--sans);fill:var(--fg-2);pointer-events:none}
 .torso .lbl.on{fill:var(--accent)}
-.torso .side{font:700 9px var(--sans);fill:var(--fg-3);pointer-events:none}
-.torso .ics{font:9px var(--num);fill:var(--fg-3);pointer-events:none}
+.torso .side{font:700 9.5px var(--sans);fill:var(--fg-3);pointer-events:none}
+.torso .ics{font:9.5px var(--num);fill:var(--fg-3);pointer-events:none}
 .torso .rib{stroke:var(--line);stroke-width:1}
 .viewnote{font-size:12px;color:var(--fg-3);text-align:center;margin-top:6px;
           line-height:1.45}
@@ -152,7 +161,7 @@ code{font-family:var(--num);font-size:13px;background:var(--track);
 
   <div class="site">
     <div>
-      <svg class="torso" id="torso" viewBox="0 0 200 260" role="group"
+      <svg class="torso" id="torso" viewBox="0 0 240 300" role="group"
            aria-label="听诊区位置示意图,正面视角"></svg>
       <div class="viewnote" id="viewnote"></div>
     </div>
@@ -449,18 +458,49 @@ function drawEnv(c, d) {
 
 let SITES = null, curSite = "MV";
 
-/* 胸廓示意图。用相对坐标画,不追求解剖精确——它的作用是**配合文字定位**,
-   真正定位要靠解剖标志(胸骨角平对第 2 肋)。这一点在提示里写明了,
-   免得有人以为照着图点就等于贴对了。 */
+/* 胸廓示意图:按解剖标志构造,不是随手画的形状。
+
+   几何全部从**胸骨角**(Louis 角)推出——它平对第 2 肋,是找肋间的起点,
+   也是我在提示里让人先摸的那个骨嵴。之前那版图恰恰没画它,等于把最关键的
+   参照物漏掉了。第 n 肋间 = 第 n 与 n+1 肋之中点。                      */
+const GEO = {
+  W: 240, H: 300, MID: 120,
+  NOTCH: 62,        // 胸骨上切迹
+  ANGLE: 88,        // 胸骨角 = 第 2 肋附着处
+  STEP: 19,         // 相邻肋骨间距
+  SB: 18,           // 胸骨缘(中线旁开)
+  MCL: 162,         // 锁骨中线
+};
+const ribY = n => GEO.ANGLE + (n - 2) * GEO.STEP;
+
 function drawTorso(best) {
   if (!SITES) return;
-  const svg = $("torso");
+  const G = GEO, svg = $("torso");
+
+  // 肋骨:自胸骨缘向外下方弯,越靠下越长越斜
+  let ribs = "";
+  for (let n = 1; n <= 7; n++) {
+    const y = ribY(n), spread = 40 + n * 7.5, drop = 12 + n * 2.2;
+    for (const sgn of [-1, 1]) {
+      const x0 = G.MID + sgn * (n === 1 ? 10 : G.SB);
+      ribs += `<path class="rib" d="M${x0} ${y}
+        q${sgn * spread * 0.55} ${drop * 0.35} ${sgn * spread} ${drop}"/>`;
+    }
+  }
+
+  // 肋间编号(受检者右侧外缘,避开听诊点)
+  let nums = "";
+  for (let n = 2; n <= 5; n++) {
+    const y = (ribY(n) + ribY(n + 1)) / 2;
+    nums += `<text class="ics" x="52" y="${y + 3.5}" text-anchor="end">${n}</text>`;
+  }
+
   const dots = SITES.sites.map(s => {
-    const [x, y] = s.xy, cx = x * 200, cy = y * 260;
-    const on = s.code === curSite;
-    const q = best && best[s.code];
+    const cx = s.xy[0] * G.W, cy = s.xy[1] * G.H;
+    const on = s.code === curSite, q = best && best[s.code];
     return `<g>
-      <circle class="dot${on ? " on" : ""}" cx="${cx}" cy="${cy}" r="8.5"
+      <circle class="halo" cx="${cx}" cy="${cy}" r="${on ? 13 : 0}"/>
+      <circle class="dot${on ? " on" : ""}" cx="${cx}" cy="${cy}" r="7.5"
               tabindex="0" role="button" aria-pressed="${on}"
               aria-label="${s.name},${s.landmark}"
               onclick="pickSite('${s.code}')"
@@ -469,23 +509,33 @@ function drawTorso(best) {
             text-anchor="middle">${s.code}${q ? " " + q.toFixed(2) : ""}</text>
     </g>`;
   }).join("");
-  // 肋间刻度:让"第几肋间"在图上是可数的,而不是只靠文字描述
-  const ribs = [2, 3, 4, 5].map(n => {
-    const y = 78 + (n - 2) * 39;
-    return `<line class="rib" x1="58" y1="${y}" x2="142" y2="${y}"/>
-            <text class="ics" x="52" y="${y + 3}" text-anchor="end">${n}</text>`;
-  }).join("");
+
   svg.innerHTML = `
-    <path class="body" d="M42 34 q58 -20 116 0 l12 40 q-8 22 -10 62
-                          q-2 60 -18 108 q-40 12 -84 0
-                          q-16 -48 -18 -108 q-2 -40 -10 -62 z"/>
+    <!-- 躯干与肩 -->
+    <path class="body" d="M62 300 L58 118 q2 -34 20 -46 q16 -11 40 -13
+                          q24 2 40 13 q18 12 20 46 L178 300 Z"/>
+    <path class="neck" d="M104 60 q16 -8 32 0 l4 12 q-20 9 -40 0 z"/>
+    <!-- 心脏轮廓:说明各听诊区为什么在那儿 -->
+    <path class="heart" d="M112 96 q34 -6 52 16 q14 20 4 44
+                           q-10 24 -34 34 q-22 -14 -28 -44 q-6 -30 6 -50 z"/>
+    <!-- 锁骨 -->
+    <path class="clav" d="M118 68 q22 -5 44 4 q14 6 22 14"/>
+    <path class="clav" d="M122 68 q-22 -5 -44 4 q-14 6 -22 14"/>
     ${ribs}
-    <line class="sternum" x1="100" y1="52" x2="100" y2="178"/>
-    <text class="lbl" x="100" y="46" text-anchor="middle">胸骨</text>
-    <text class="side" x="20" y="150" text-anchor="middle">受检者
-      <tspan x="20" dy="11">右侧</tspan></text>
-    <text class="side" x="180" y="150" text-anchor="middle">受检者
-      <tspan x="180" dy="11">左侧</tspan></text>
+    <!-- 胸骨:柄 + 体,中间是胸骨角 -->
+    <path class="sternum" d="M${G.MID - 9} ${G.NOTCH} h18 v${G.ANGLE - G.NOTCH}
+          l-3 4 h-12 l-3 -4 z"/>
+    <path class="sternum" d="M${G.MID - 6} ${G.ANGLE + 4} h12 v${ribY(7) - G.ANGLE - 4}
+          q-6 10 -12 0 z"/>
+    <line class="angle" x1="${G.MID - 20}" y1="${G.ANGLE}"
+          x2="${G.MID + 20}" y2="${G.ANGLE}"/>
+    <text class="key-lbl" x="${G.MID + 25}" y="${G.ANGLE - 4}">胸骨角 · 第2肋</text>
+    <!-- 锁骨中线 -->
+    <line class="mcl" x1="${G.MCL}" y1="76" x2="${G.MCL}" y2="200"/>
+    <text class="key-lbl" x="${G.MCL + 4}" y="212">锁骨中线</text>
+    ${nums}
+    <text class="side" x="34" y="252" text-anchor="middle">受检者<tspan x="34" dy="12">右侧</tspan></text>
+    <text class="side" x="206" y="252" text-anchor="middle">受检者<tspan x="206" dy="12">左侧</tspan></text>
     ${dots}`;
 }
 

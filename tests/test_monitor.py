@@ -248,3 +248,45 @@ def test_sites_ics_increases_downward_on_diagram():
     pairs = sorted((s["ics"], s["xy"][1]) for s in SITES)
     ys = [y for _, y in pairs]
     assert ys == sorted(ys), f"肋间号与图上高度不单调:{pairs}"
+
+
+def test_site_coords_derive_from_rib_geometry():
+    """听诊点坐标必须由**肋间几何**推出,不是手填的数字。
+
+    与 ui.html 里的 GEO 保持同一套构造:胸骨角(Louis 角)平对第 2 肋,
+    相邻肋间距 19,第 n 肋间 = 第 n 与 n+1 肋之中点;胸骨缘 = 中线旁开 18,
+    锁骨中线 x=162。这两处一旦漂移,图上的点就会离开它标称的肋间。
+    """
+    from heartsound.sites import BY_CODE
+    W, H, MID, ANGLE, STEP, SB, MCL = 240, 300, 120, 88, 19, 18, 162
+
+    def rib_y(n):
+        return ANGLE + (n - 2) * STEP
+
+    def ics_y(n):
+        return (rib_y(n) + rib_y(n + 1)) / 2
+
+    expect = {
+        "AV": (MID - SB, ics_y(2)),
+        "PV": (MID + SB, ics_y(2)),
+        "ERB": (MID + SB, ics_y(3)),
+        "TV": (MID + SB, ics_y(4)),
+        "MV": (MCL - 4, ics_y(5)),
+    }
+    for code, (ex, ey) in expect.items():
+        gx, gy = BY_CODE[code]["xy"]
+        assert abs(gx * W - ex) < 1.0, f"{code} 的 x 偏离胸骨/锁骨中线基准"
+        assert abs(gy * H - ey) < 1.0, f"{code} 的 y 偏离第 {BY_CODE[code]['ics']} 肋间"
+
+
+def test_diagram_marks_the_sternal_angle():
+    """图上必须画出胸骨角——它是"往下数肋间"的起点。
+
+    上一版示意图恰恰漏了它:提示里让人先摸胸骨角,图上却没有这个参照物。
+    """
+    import os
+    ui = open(os.path.join(os.path.dirname(__file__), "..", "heartsound",
+                           "ui.html"), encoding="utf-8").read()
+    assert "胸骨角" in ui, "示意图未标出胸骨角"
+    assert "锁骨中线" in ui, "示意图未标出锁骨中线(心尖区定位需要)"
+    assert "受检者" in ui, "示意图未标出左右"
