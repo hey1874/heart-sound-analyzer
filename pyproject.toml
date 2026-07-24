@@ -35,7 +35,7 @@ packages = ["heartsound"]
 
 [tool.setuptools.package-data]
 # 监视界面是单页 HTML,必须随包一起装
-heartsound = ["ui.html"]
+heartsound = ["ui.html", "thorax.png"]
 py-modules = ["heartbeat", "predict", "classifier", "selftest", "checkmic",
               "calibrate", "external_eval", "train_cnn", "monitor"]
 
