@@ -84,12 +84,90 @@ def test_downsample_preserves_extremes(spike_at):
     x = np.zeros(20000)
     x[spike_at] = 5.0
     x[(spike_at + 3) % 20000] = -4.0
-    out = _downsample(x, 1200)
-    assert len(out) <= 1200, f"输出 {len(out)} 点,超过上限 1200"
-    assert max(out) >= 4.9, f"尖峰在 {spike_at} 处被抹掉了"
-    assert min(out) <= -3.9, f"负向尖峰在 {spike_at} 附近被抹掉了"
+    d = _downsample(x, 1000)
+    assert d["n"] <= 1000, f"输出 {d['n']} 列,超过上限 1000"
+    assert max(d["hi"]) >= 4.9, f"尖峰在 {spike_at} 处被抹掉了"
+    assert min(d["lo"]) <= -3.9, f"负向尖峰在 {spike_at} 附近被抹掉了"
 
 
-def test_downsample_short_input_passthrough():
-    x = np.arange(10.0)
-    assert _downsample(x, 1200) == [float(v) for v in x]
+def test_downsample_returns_three_layers():
+    """每列给 (最小, 最大, RMS) 三个量。
+
+    只画 min/max 包络,心音这类脉冲信号会呈现为"平线 + 孤立尖峰";RMS 层
+    把中间填实,而且它表达的是真实能量,不是把振幅拉伸的视觉作弊。
+    """
+    x, _ = synthesize(bpm=72, secs=8, seed=1)
+    d = _downsample(x, 500)
+    assert d["n"] == 500
+    for k in ("lo", "hi", "rms"):
+        assert len(d[k]) == d["n"], f"{k} 长度与列数不符"
+    lo, hi, rms = map(np.array, (d["lo"], d["hi"], d["rms"]))
+    assert (hi >= lo).all(), "每列必须 max >= min"
+    assert (rms >= 0).all(), "RMS 不可为负"
+    assert (rms <= np.maximum(np.abs(lo), np.abs(hi)) + 1e-9).all(),         "RMS 不可超过该列的峰值"
+
+
+def test_downsample_ref_is_robust_percentile():
+    """归一化基准用 99.5 分位而非绝对最大值。
+
+    最大值被 S1 那一根尖峰独占,拿它做基准会把其余部分全压扁
+    (实测列高中位从 8.9px 掉到 6.5px)。
+    """
+    x, _ = synthesize(bpm=72, secs=8, seed=1)
+    x = np.concatenate([x, [x.max() * 20]])          # 注入一个孤立巨峰
+    d = _downsample(x, 500)
+    assert d["ref"] < np.abs(x).max() / 5, "基准被单个离群峰带跑了"
+
+
+def test_downsample_short_input():
+    d = _downsample(np.arange(10.0), 1000)
+    assert d["n"] == 10 and len(d["hi"]) == 10
+
+
+# --- 数据链对齐 -------------------------------------------------------------
+
+@pytest.mark.parametrize("secs", [4, 6, 8, 12, 20])
+def test_spectrogram_covers_full_time_axis(secs):
+    """回归:频谱图抽帧曾直接截断尾部,时间轴对不上。
+
+    早先写成 m[:, :k*n_frames](k 为整除商),8 秒窗只剩 89% 的时间轴、
+    12 秒窗只剩 59%,却仍铺满整个画布并标秒刻度——频谱图与包络图上的
+    S1/S2 因此错位。这类错误肉眼很难发现,但会让人读错杂音的时相。
+    """
+    from heartsound.cnn import logmel
+    from heartsound.monitor import _spectrogram
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=secs, seed=1)
+    xr = an.resample(x, fs)
+    full = logmel(xr).shape[1]
+    sp = _spectrogram(xr, an.fs)
+    assert sp["w"] == min(full, 220)
+
+    # 把最后 5% 的时间放大 40 倍,抽样后这段必须仍是全图最亮处——
+    # 证明尾部没有被截掉。不要求"最后一列恰好是 255":末尾几帧的 STFT
+    # 窗口跨在放大区边界上,那样断言是在过度指定实现细节。
+    xr2 = xr.copy()
+    xr2[-len(xr2) // 20:] *= 40
+    sp2 = _spectrogram(xr2, an.fs)
+    d = np.array(sp2["data"], float).reshape(sp2["w"], sp2["h"])
+    tail = max(3, sp2["w"] // 20)                 # 放大区对应的列数
+    mid = d[sp2["w"] // 3: 2 * sp2["w"] // 3].max()
+    assert d[-tail:].max() > mid + 40, (
+        f"时间轴末尾被截掉了:末段最大 {d[-tail:].max():.0f} "
+        f"未显著高于中段 {mid:.0f}")
+    assert d.argmax() // sp2["h"] >= sp2["w"] - tail, "全图最亮处不在放大区"
+
+
+def test_all_charts_share_one_time_axis():
+    """波形、包络、频谱图必须张成同一段时间——它们叠在同一条秒刻度上读。"""
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=8, seed=1)
+    r = an.analyze(x, fs)
+    p = _build_payload(an, r, int(fs), "d", 0)
+    dur = len(r["env"]) / an.fs
+    assert abs(p["window_s"] - dur) < 0.02
+    # S1/S2/心音峰都以 0..1 的相对位置给出,直接乘画布宽度
+    for k in ("s1", "s2", "beats"):
+        assert all(0.0 <= v <= 1.0 for v in p[k]), f"{k} 越界"
+    # 三张图的数据量都非零且各自自洽
+    assert p["wave"]["n"] > 0 and p["env"]["n"] > 0 and p["spec"]["w"] > 0

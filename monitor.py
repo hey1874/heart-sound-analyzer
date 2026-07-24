@@ -1,6 +1,7 @@
 """
 monitor.py — 浏览器里的实时心音监视界面(上位机)。
 
+    python monitor.py --demo           # 合成数据驱动,不需要麦克风
     python monitor.py                  # 默认输入设备,自动开浏览器
     python monitor.py --device 2 --port 8800
     python monitor.py --no-browser
@@ -26,13 +27,16 @@ def main(argv: list[str]) -> int:
     p.add_argument("--conf-gate", type=float, default=0.30,
                    help="置信度门限,低于此判信号不清")
     p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    p.add_argument("--demo", action="store_true",
+                   help="用合成心音驱动界面,不需要麦克风(接线前先验界面)")
     a = p.parse_args(argv)
 
     dev = a.device
     if dev is not None and dev.isdigit():
         dev = int(dev)
     return serve(device=dev, port=a.port, window_s=a.window, hop_s=a.hop,
-                 conf_gate=a.conf_gate, open_browser=not a.no_browser)
+                 conf_gate=a.conf_gate, open_browser=not a.no_browser,
+                 demo=a.demo)
 
 
 if __name__ == "__main__":

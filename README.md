@@ -147,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install -e ".[test]" && python -m pytest tests/ -q   # 130 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 147 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
@@ -179,13 +179,17 @@ S1/S2 主能量;声卡本身也可能在 50–100Hz 以下高通;还有工频、
 **实时监视界面**(推荐):
 
 ```bash
-python monitor.py               # 打开浏览器,实时看波形/包络/分段/质量
+python monitor.py --demo        # 合成数据驱动,不接硬件也能看界面
+python monitor.py               # 实时:波形 / 频谱图 / 包络分段 / 信号质量
 python monitor.py --device 2 --port 8800
 ```
 
 终端只有一行数字,而贴听诊器时你需要**看见**:波形长什么样、包络上 S1/S2
 标在哪、信号质量为什么不合格。看不见就无从判断是位置不对、贴得不稳,还是
 链路本身有问题。
+
+三张图共用同一条时间轴:**波形**(看幅度与信噪)→ **频谱图**(看杂音落在哪个
+频段、哪个时相)→ **能量包络 + S1/S2 分段**(看切得准不准)。
 
 界面遵循一条设计原则:**不让不可靠的判定看起来权威**——
 

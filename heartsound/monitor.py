@@ -48,30 +48,74 @@ def _page() -> bytes:
     return PAGE
 
 
-def _downsample(x: np.ndarray, n: int) -> list[float]:
-    """给绘图用的降采样:分段取 (最小, 最大),保住波形的真实起伏。
+def _spectrogram(xr: np.ndarray, fs: float, n_frames: int = 220) -> dict:
+    """给界面用的对数梅尔频谱图,量化成 0-255 的整数。
 
-    为什么不隔点抽样:那会漏掉尖峰,画出来的波形比实际**更干净**——对一个
-    以"判断信号质量"为要务的界面来说,这种失真正好把该看见的问题藏起来。
+    为什么用频谱图而不是原始波形当主角:心音是**脉冲信号**——实测峰峰值
+    中位数只有最大值的 5.5%,仅 4.9% 的列超过最大值一半。极值填充带画出来
+    必然是"一条近乎平直的线 + 几根孤立尖峰",稀疏破碎。音频编辑器里波形
+    好看是因为音乐/语音能量连续,心音不是。
 
-    末尾补齐后再分段:直接截断会丢掉最后不足一段的样本,尖峰若落在末尾就
-    看不见了。输出点数保证不超过 n。
+    而频谱图对这个领域信息量大得多:**杂音就是收缩期里的高频能量带,在
+    频谱图上直接看得见**。这也正是 CNN 吃的表示(见 cnn.logmel)。
+
+    量化到 0-255 是为了控制负载:64×220 的浮点数组约 56KB,量化后 14KB。
+    """
+    from .cnn import logmel
+
+    if xr.size < 512:
+        return {"w": 0, "h": 0, "data": []}
+    m = logmel(xr)                       # (n_mels, frames),已是对数域
+    if m.shape[1] > n_frames:
+        # 分箱必须**覆盖整条时间轴**。早先写成 m[:, :k*n_frames](k 为整除
+        # 商)会把尾部余数直接截掉:8 秒窗只剩 89% 的时间轴、12 秒窗只剩
+        # 59%,却仍被铺满整个画布宽度并标上秒刻度——频谱图与包络图的
+        # S1/S2 因此对不上。改用覆盖全轴的边界索引。
+        edge = np.linspace(0, m.shape[1], n_frames + 1).astype(int)
+        m = np.stack([m[:, edge[i]:max(edge[i] + 1, edge[i + 1])].max(axis=1)
+                      for i in range(n_frames)], axis=1)
+    lo = float(np.percentile(m, 5))      # 5% 分位当底,拉开对比度
+    hi = float(m.max())
+    if hi - lo < 1e-9:
+        return {"w": 0, "h": 0, "data": []}
+    q = np.clip((m - lo) / (hi - lo), 0, 1)
+    return {"w": int(m.shape[1]), "h": int(m.shape[0]),
+            "data": (q * 255).astype(np.uint8).T.ravel().tolist()}
+
+
+def _downsample(x: np.ndarray, n_cols: int = 1000) -> dict:
+    """给绘图用的降采样:每列给出 (最小, 最大, RMS)。
+
+    为什么要三个量而不是两个
+    ------------------------
+    心音是**脉冲信号**:实测峰峰值中位数只有最大值的 5.5%,只有 4.9% 的列
+    超过最大值一半。只画 min/max 包络,画出来就是"一条近乎平直的线 + 几根
+    孤立尖峰",稀疏破碎。
+
+    专业音频软件的画法是**双层**:外层浅色画峰值包络,内层深色画 RMS。
+    RMS 把中间填实,波形有了体量感,而且它表达的是**真实能量**,不是把
+    振幅拉伸的视觉作弊。
+
+    归一化用 99.5 分位而非绝对最大值:最大值被 S1 那一根尖峰独占,拿它做
+    基准会把其余部分全压扁(实测列高中位从 8.9px 掉到 6.5px)。
+
+    为什么不隔点抽样:那会漏掉尖峰,画出来比实际**更干净**——对一个以判断
+    信号质量为要务的界面,这种失真正好把该看见的问题藏起来。
     """
     x = np.asarray(x, float).ravel()
-    if x.size == 0:
-        return []
-    if x.size <= n:
-        return [round(float(v), 5) for v in x]
-    half = max(1, n // 2)
-    k = int(np.ceil(x.size / half))                # 每段样本数
+    if x.size < 4:
+        return {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0}
+    n_cols = max(1, min(n_cols, x.size))
+    k = int(np.ceil(x.size / n_cols))
     pad = (-x.size) % k
     if pad:                                        # 用末值补齐,不丢尾部
         x = np.concatenate([x, np.full(pad, x[-1])])
     seg = x.reshape(-1, k)
-    out = np.empty(seg.shape[0] * 2)
-    out[0::2] = seg.min(axis=1)
-    out[1::2] = seg.max(axis=1)
-    return [round(float(v), 5) for v in out]
+    ref = float(np.percentile(np.abs(x), 99.5)) or float(np.max(np.abs(x))) or 1.0
+    r3 = lambda a: [round(float(v), 4) for v in a]      # noqa: E731
+    return {"n": int(seg.shape[0]), "ref": round(ref, 6),
+            "lo": r3(seg.min(axis=1)), "hi": r3(seg.max(axis=1)),
+            "rms": r3(np.sqrt((seg ** 2).mean(axis=1)))}
 
 
 class State:
@@ -144,8 +188,12 @@ def _build_payload(an: HeartSoundAnalyzer, res: dict, fs: int,
         "extra_flag": ex.get("flag"),
         "split_flag": sp.get("flag"),
         # --- 绘图数据 ---
-        "wave": _downsample(wave, 1200) if wave is not None else [],
-        "env": _downsample(env, 1200) if env is not None else [],
+        "wave": _downsample(wave, 1000) if wave is not None else
+                {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0},
+        "spec": _spectrogram(res.get("resampled"), an.fs)
+                if res.get("resampled") is not None else {"w": 0, "h": 0, "data": []},
+        "env": _downsample(env, 900) if env is not None else
+               {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0},
         "beats": ([round(float(v) / n_env, 5) for v in beats]
                   if beats is not None and n_env else []),
         "s1": s1, "s2": s2,
@@ -181,6 +229,45 @@ def capture_loop(state: State, device, window_s: float, hop_s: float,
         cap.stop()
 
 
+DEMO_SCENES = [
+    ("正常", dict(bpm=68, secs=8, noise=0.05, seed=11)),
+    ("收缩期杂音", dict(bpm=72, secs=8, murmur=0.5, murmur_shape="diamond",
+                        noise=0.05, seed=2)),
+    ("环境噪声偏大", dict(bpm=74, secs=8, noise=0.28, seed=23)),
+    ("50Hz 工频干扰", dict(bpm=72, secs=8, hum_hz=50.0, hum=3.0, seed=5)),
+    ("削波/过载", dict(bpm=70, secs=8, noise=0.05, seed=31)),
+]
+
+
+def demo_loop(state: State, hop_s: float, conf_gate: float) -> None:
+    """用合成心音驱动界面,不需要麦克风。
+
+    存在的理由不只是"演示":没有硬件时也能确认界面、门控、绘图都正常,
+    接线之前就能排除软件侧的问题。轮播几种典型状态,好让被拒绝的那几种
+    (工频、削波、噪声大)也能被看到——它们恰恰是最需要界面说清楚的情况。
+    """
+    import time
+
+    from .synth import synthesize
+
+    an = HeartSoundAnalyzer(conf_thr=conf_gate)
+    i = 0
+    while not state.stop:
+        name, kw = DEMO_SCENES[i % len(DEMO_SCENES)]
+        x, fs = synthesize(**kw)
+        if name.startswith("削波"):
+            x = np.clip(x / (np.max(np.abs(x)) or 1) * 3.0, -1.0, 1.0)
+        payload = _build_payload(an, an.analyze(x, fs), int(fs),
+                                 f"演示模式 · {name}", 0)
+        state.set(payload)
+        i += 1
+        # 每种状态停留几拍,便于看清;Ctrl+C 能及时退出
+        for _ in range(int(max(1, 4 / max(hop_s, 0.1)))):
+            if state.stop:
+                return
+            time.sleep(hop_s)
+
+
 def make_handler(state: State):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):                               # noqa: N802
@@ -209,17 +296,25 @@ def make_handler(state: State):
 
 def serve(device=None, port: int = 8765, window_s: float = 6.0,
           hop_s: float = 1.0, conf_gate: float = 0.30,
-          open_browser: bool = True) -> int:
+          open_browser: bool = True, demo: bool = False) -> int:
     state = State()
-    t = threading.Thread(target=capture_loop, daemon=True,
-                         args=(state, device, window_s, hop_s, conf_gate))
+    if demo:
+        t = threading.Thread(target=demo_loop, daemon=True,
+                             args=(state, hop_s, conf_gate))
+    else:
+        t = threading.Thread(target=capture_loop, daemon=True,
+                             args=(state, device, window_s, hop_s, conf_gate))
     t.start()
 
     # 只绑 127.0.0.1:这是本机监视工具,没有任何鉴权,不应暴露到网络上
     srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
     url = f"http://127.0.0.1:{port}/"
     print(f"🎙  监视界面: {url}")
-    print("   把听诊器贴稳(胸骨左缘第 4 肋间 或 心尖),Ctrl+C 退出。")
+    if demo:
+        print("   演示模式:用合成心音驱动,不需要麦克风。轮播 "
+              f"{len(DEMO_SCENES)} 种典型状态。")
+    else:
+        print("   把听诊器贴稳(胸骨左缘第 4 肋间 或 心尖),Ctrl+C 退出。")
     print("   仅监听本机回环地址,未做鉴权,请勿暴露到公网。")
     if open_browser:
         import webbrowser

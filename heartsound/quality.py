@@ -82,6 +82,9 @@ class QualityMixin:
         """
         x = np.asarray(x, dtype=np.float64)
         clip = self.clip_fraction(x if x_raw is None else x_raw)
+        raw = np.asarray(x if x_raw is None else x_raw, dtype=np.float64).ravel()
+        peak = float(np.max(np.abs(raw))) if raw.size else 0.0
+        level_dbfs = 20.0 * np.log10(peak + 1e-12)
         f, p = signal.welch(x, fs=self.fs, nperseg=min(len(x), 2048))
         in_band = (f >= self.band[0]) & (f <= self.band[1])
         band_ratio = float(p[in_band].sum() / (p.sum() + 1e-12))
@@ -93,7 +96,7 @@ class QualityMixin:
         return {
             "sqi": sqi, "periodicity": periodicity,
             "band_ratio": band_ratio, "band_clean": band_clean,
-            "hum": hum, "clip": clip,
+            "hum": hum, "clip": clip, "level_dbfs": level_dbfs,
             "ok": bool(sqi >= self.sqi_thr and clip < 0.02 and hum < self.hum_thr),
         }
 
@@ -113,6 +116,19 @@ class QualityMixin:
             return False, "削波/过载(调低输入增益)"
         if sqi.get("hum", 0.0) >= self.hum_thr:
             return False, "工频干扰(检查屏蔽/接地,或改用电池供电)"
+        # 电平过低:这一项是真实硬件上暴露出来的。一段峰值 -78 dBFS 的录音
+        # (麦克风实际没在采集)曾被判为可采信,并自信地报出 180.2 BPM、
+        # 置信度 0.75——那 180 BPM 正好是搜索区上限,来自采集链路的周期性
+        # 伪影而非心音。
+        #
+        # 注意低电平本身**不会**让算法失效:实测把一段干净信号衰减到 -90 dBFS
+        # (只剩 2 个量化步)心率仍算对,纯噪声也能被正确拒绝。真正的问题是
+        # 在接近底噪的电平上**无法区分心音与采集伪影**——两者都有周期性。
+        # 所以这里拒绝的理由不是"算不出来",而是"算出来也不可信"。
+        lv = sqi.get("level_dbfs")
+        if lv is not None and lv < self.level_thr_dbfs:
+            return False, (f"输入电平过低(峰值 {lv:.0f} dBFS),接近底噪,"
+                           "无法区分心音与采集噪声 —— 请调高输入增益")
         if res.get("confidence", 0.0) < self.conf_thr:
             return False, "心音不规律或信号弱(调整听诊器位置、压紧)"
         if not sqi.get("ok", False):

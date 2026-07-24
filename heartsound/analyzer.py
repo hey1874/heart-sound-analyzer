@@ -62,6 +62,10 @@ class HeartSoundAnalyzer(DSPMixin, QualityMixin, SegmentationMixin, FeatureMixin
         sqi_thr: float = 0.35,
         conf_thr: float = 0.30,
         hum_thr: float = 0.80,
+        # 输入电平下限(峰值 dBFS,按 ±1.0 满量程的浮点音频约定)。
+        # -50 dBFS ≈ 满量程的 0.3%:低于此说明增益没开对,此时信号与采集
+        # 噪声无法区分。见 _reliability 中的说明。
+        level_thr_dbfs: float = -50.0,
     ) -> None:
         self.fs = float(fs_proc)
         self.band = band
@@ -81,6 +85,7 @@ class HeartSoundAnalyzer(DSPMixin, QualityMixin, SegmentationMixin, FeatureMixin
         # 0.3~0.5、hum 指标 0.87~0.95 处。中间地带交给综合 SQI 判(它已按
         # (1-hum) 折算带内占比)。
         self.hum_thr = hum_thr
+        self.level_thr_dbfs = level_thr_dbfs
         # 带通滤波器用二阶节(SOS)形式,数值更稳定;阶数 4。
         # 低带:提取 S1/S2 心音用于包络/节律。
         self.sos = signal.butter(
@@ -182,7 +187,8 @@ class HeartSoundAnalyzer(DSPMixin, QualityMixin, SegmentationMixin, FeatureMixin
             "beats": beats,             # 峰索引(基于 fs_proc)
             "env": env,                 # 主带包络(心率/可视化用)
             "env_seg": None,            # 分段专用窄带包络(见 sos_seg)
-            "filtered": xb,             # 滤波后波形(可视化用)
+            "filtered": xb,             # 带通后波形(可视化用)
+            "resampled": xr,            # 重采样后的原始波形(频谱图用:需完整频段)
             "fs_proc": self.fs,
             "sqi": None, "rhythm": None, "sti": None, "murmur": None,
             "extra_sounds": None, "s2_split": None, "hrv_freq": None,
@@ -224,7 +230,7 @@ class HeartSoundAnalyzer(DSPMixin, QualityMixin, SegmentationMixin, FeatureMixin
             "bpm": None, "confidence": 0.0, "n_beats": 0,
             "beats": np.array([], dtype=int),
             "env": np.array([]), "env_seg": np.array([]),
-            "filtered": np.array([]),
+            "filtered": np.array([]), "resampled": np.array([]),
             "fs_proc": self.fs,
             "sqi": None, "rhythm": None, "sti": None, "murmur": None,
             "extra_sounds": None, "s2_split": None, "hrv_freq": None,

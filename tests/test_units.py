@@ -201,3 +201,47 @@ def test_calibrate_module_imports():
     assert calibrate.reference_bpm([(0.0, 0.1, 1)]) is None
     segs = [(i * 0.8, i * 0.8 + 0.1, 1) for i in range(8)]
     assert abs(calibrate.reference_bpm(segs) - 75.0) < 0.1
+
+
+# --- 输入电平门控 -----------------------------------------------------------
+
+def test_near_silence_is_rejected_not_confidently_analyzed():
+    """回归:接近底噪的录音曾被判可采信并报出 180.2 BPM(搜索区上限)。
+
+    这个缺陷是接上真实麦克风才暴露的:一段峰值 -78 dBFS 的录音(麦克风实际
+    没在采集)得到 reliable=True、置信度 0.75——那个周期性来自采集链路伪影,
+    不是心音。合成信号测不出来,因为合成的"静音"是理想白噪声。
+    """
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=10, noise=0.05, seed=3)
+    x = x / np.max(np.abs(x))
+    r = an.analyze(x * 10 ** (-78 / 20), fs)
+    assert r["reliable"] is False
+    assert "电平过低" in (r["unreliable_reason"] or "")
+
+
+@pytest.mark.parametrize("dbfs,expect_ok", [
+    (0, True), (-20, True), (-40, True), (-45, True),
+    (-55, False), (-70, False), (-90, False),
+])
+def test_level_gate_threshold(dbfs, expect_ok):
+    """门限定在 -50 dBFS(满量程的 0.3%)。
+
+    低电平本身**不会**让算法失效——实测衰减到 -90 dBFS(仅 2 个量化步)
+    心率仍算对。拒绝的理由是"算出来也不可信":在接近底噪的电平上无法区分
+    心音与采集伪影,两者都有周期性。
+    """
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=10, noise=0.05, seed=3)
+    x = x / np.max(np.abs(x)) * 10 ** (dbfs / 20)
+    r = an.analyze(x, fs)
+    assert r["reliable"] is expect_ok, r["unreliable_reason"]
+    if expect_ok:
+        assert abs(r["bpm"] - 72) < 3
+
+
+def test_level_reported_in_sqi():
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=8, seed=1)
+    lv = an.analyze(x, fs)["sqi"]["level_dbfs"]
+    assert -3 < lv < 12, f"合成信号峰值约 0 dBFS 量级,实得 {lv}"
