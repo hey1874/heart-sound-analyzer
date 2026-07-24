@@ -32,8 +32,12 @@ Homepage = "https://github.com/hey1874/heart-sound-analyzer"
 
 [tool.setuptools]
 packages = ["heartsound"]
+
+[tool.setuptools.package-data]
+# 监视界面是单页 HTML,必须随包一起装
+heartsound = ["ui.html"]
 py-modules = ["heartbeat", "predict", "classifier", "selftest", "checkmic",
-              "calibrate", "external_eval", "train_cnn"]
+              "calibrate", "external_eval", "train_cnn", "monitor"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,262 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>心音监视</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171b21; --line:#252b34; --fg:#e6e9ee; --dim:#8b95a3;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff;
+  }
+  @media (prefers-color-scheme: light){
+    :root{--bg:#f6f7f9;--panel:#fff;--line:#e3e6ea;--fg:#1a1d21;--dim:#69707a;}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
+  header{padding:12px 18px;border-bottom:1px solid var(--line);
+         display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;font-weight:600}
+  .meta{color:var(--dim);font-size:12px}
+  main{padding:14px 18px;max-width:1100px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--line);
+         border-radius:10px;padding:14px;margin-bottom:14px}
+  .quality{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  .dot{width:12px;height:12px;border-radius:50%;flex:none}
+  .big{font-size:32px;font-weight:600;font-variant-numeric:tabular-nums}
+  .unit{font-size:13px;color:var(--dim);font-weight:400}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .cell{background:var(--panel);border:1px solid var(--line);
+        border-radius:8px;padding:10px 12px}
+  .cell .k{font-size:11px;color:var(--dim);display:flex;gap:5px;align-items:center}
+  .cell .v{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;
+           margin-top:2px}
+  .tag{font-size:9px;padding:1px 5px;border-radius:99px;border:1px solid currentColor;
+       color:var(--warn);white-space:nowrap;font-weight:600}
+  canvas{width:100%;display:block;border-radius:6px;background:transparent}
+  .cap{font-size:11px;color:var(--dim);margin:6px 0 2px}
+  .muted{opacity:.34;filter:saturate(.25)}
+  .banner{border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:12px;
+          border:1px solid}
+  .banner.bad{border-color:var(--bad);color:var(--bad);background:#f8514912}
+  .banner.warn{border-color:var(--warn);color:var(--warn);background:#d2992212}
+  .legend{display:flex;gap:14px;font-size:11px;color:var(--dim);margin-top:5px}
+  .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;
+      vertical-align:middle}
+  footer{color:var(--dim);font-size:11px;padding:8px 18px 24px;max-width:1100px;
+         margin:0 auto;border-top:1px solid var(--line)}
+  code{background:#8883;padding:1px 4px;border-radius:3px;font-size:11px}
+</style>
+
+<header>
+  <h1>心音监视</h1>
+  <span class="meta" id="dev">正在连接…</span>
+</header>
+
+<main>
+  <div id="banner"></div>
+
+  <div class="panel">
+    <div class="quality">
+      <span class="dot" id="qdot" style="background:var(--dim)"></span>
+      <div>
+        <div class="k" style="font-size:11px;color:var(--dim)">信号质量 SQI</div>
+        <div class="big" id="sqi">—</div>
+      </div>
+      <div style="flex:1;min-width:230px">
+        <div class="cap" id="qdetail">等待数据…</div>
+        <div class="legend">
+          <span>周期性 <b id="q-per">—</b></span>
+          <span>带内占比 <b id="q-band">—</b></span>
+          <span>工频 <b id="q-hum">—</b></span>
+          <span>削波 <b id="q-clip">—</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid" id="verified">
+    <div class="cell"><div class="k">心率</div>
+      <div class="v"><span id="bpm">—</span> <span class="unit">BPM</span></div></div>
+    <div class="cell"><div class="k">置信度</div>
+      <div class="v" id="conf">—</div></div>
+    <div class="cell"><div class="k">收缩期</div>
+      <div class="v"><span id="sys">—</span> <span class="unit">ms</span></div></div>
+    <div class="cell"><div class="k">舒张期</div>
+      <div class="v"><span id="dia">—</span> <span class="unit">ms</span></div></div>
+    <div class="cell"><div class="k">窗内心音</div>
+      <div class="v" id="nb">—</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="cap">带通后波形(20–200 Hz)</div>
+    <canvas id="cwave" height="110"></canvas>
+    <div class="cap" style="margin-top:10px">香农能量包络 + 分段</div>
+    <canvas id="cenv" height="130"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--accent)"></i>包络</span>
+      <span><i class="sw" style="background:var(--ok)"></i>S1</span>
+      <span><i class="sw" style="background:var(--warn)"></i>S2</span>
+      <span><i class="sw" style="background:var(--dim)"></i>检出心音峰</span>
+    </div>
+  </div>
+
+  <div class="panel" id="uncal">
+    <div class="cap" style="margin-bottom:9px">
+      以下判定的阈值<b>未在你的设备上标定</b>,仅作提示 ——
+      外部验证显示跨设备直接用只有 AUC 0.55–0.65
+    </div>
+    <div class="grid">
+      <div class="cell"><div class="k">节律 <span class="tag">未标定</span></div>
+        <div class="v" style="font-size:14px" id="rhythm">—</div></div>
+      <div class="cell"><div class="k">杂音 <span class="tag">未标定</span></div>
+        <div class="v" style="font-size:14px" id="murmur">—</div></div>
+      <div class="cell"><div class="k">额外音 S3/S4 <span class="tag">未标定</span></div>
+        <div class="v" style="font-size:14px" id="extra">—</div></div>
+      <div class="cell"><div class="k">S2 分裂 <span class="tag">未标定</span></div>
+        <div class="v" style="font-size:14px" id="split">—</div></div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  ⚠️ 本工具<b>不是医疗器械</b>,输出不构成任何医学诊断。如有健康问题请就医。<br>
+  节律变异与 HRV 在真实数据上与真值相关系数仅 0.40,<b>不要用于判断心律失常</b>。
+  想让判定可用,需用自己设备采集的标注数据跑 <code>calibrate.py</code> 重新标定。
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const f = (v, n = 0, dash = "—") =>
+  (v === null || v === undefined || Number.isNaN(v)) ? dash : Number(v).toFixed(n);
+
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w * dpr || c.height !== h * dpr) {
+    c.width = w * dpr; c.height = h * dpr;
+  }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  return { g, w, h };
+}
+
+function css(v) {
+  return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+}
+
+function drawWave(c, data) {
+  const { g, w, h } = fitCanvas(c);
+  if (!data.length) return;
+  let m = 0; for (const v of data) m = Math.max(m, Math.abs(v));
+  m = m || 1;
+  g.strokeStyle = css("--line"); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
+  g.strokeStyle = css("--accent"); g.lineWidth = 1;
+  g.beginPath();
+  data.forEach((v, i) => {
+    const x = i / (data.length - 1) * w, y = h / 2 - v / m * (h / 2 - 3);
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  });
+  g.stroke();
+}
+
+function drawEnv(c, d) {
+  const { g, w, h } = fitCanvas(c);
+  const e = d.env || [];
+  if (!e.length) return;
+  let lo = Infinity, hi = -Infinity;
+  for (const v of e) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const span = (hi - lo) || 1;
+  const yOf = v => h - 14 - (v - lo) / span * (h - 22);
+
+  // 竖线标记:S1 绿、S2 黄、检出峰灰
+  const mark = (arr, color, lw) => {
+    g.strokeStyle = color; g.lineWidth = lw;
+    for (const p of arr || []) {
+      const x = p * w;
+      g.beginPath(); g.moveTo(x, 4); g.lineTo(x, h - 10); g.stroke();
+    }
+  };
+  mark(d.beats, css("--dim"), 1);
+  mark(d.s1, css("--ok"), 2);
+  mark(d.s2, css("--warn"), 2);
+
+  g.strokeStyle = css("--accent"); g.lineWidth = 1.4;
+  g.beginPath();
+  e.forEach((v, i) => {
+    const x = i / (e.length - 1) * w;
+    i ? g.lineTo(x, yOf(v)) : g.moveTo(x, yOf(v));
+  });
+  g.stroke();
+
+  g.fillStyle = css("--dim"); g.font = "10px system-ui";
+  g.fillText(`最近 ${d.window_s || "?"} 秒`, 4, h - 1);
+}
+
+let lastData = null;
+
+function render(d) {
+  lastData = d;
+  if (d.status === "error") {
+    $("banner").innerHTML =
+      `<div class="banner bad"><b>出错</b> — ${d.message || ""}</div>`;
+    return;
+  }
+  if (d.status === "starting" || d.status === "waiting") {
+    $("dev").textContent = d.device ? `${d.device} · ${d.fs} Hz` : "";
+    $("banner").innerHTML =
+      `<div class="banner warn">正在采集,等待缓冲填满(约 6 秒)…</div>`;
+    return;
+  }
+
+  $("dev").textContent =
+    `${d.device} · ${d.fs} Hz` + (d.xruns ? ` · 音频溢出 ${d.xruns} 次` : "");
+
+  const q = d.sqi || {};
+  $("sqi").textContent = f(q.sqi, 2);
+  $("q-per").textContent = f(q.periodicity, 2);
+  $("q-band").textContent = f(q.band_ratio, 2);
+  $("q-hum").textContent = f(q.hum, 2);
+  $("q-clip").textContent = f(q.clip, 3);
+
+  // 质量不合格 -> 判定区整体变灰,并写明原因和怎么改
+  const ok = d.reliable;
+  $("qdot").style.background = ok ? css("--ok") : css("--bad");
+  $("qdetail").textContent = ok
+    ? "信号可采信"
+    : (d.reason || "信号不清");
+  $("banner").innerHTML = ok ? "" :
+    `<div class="banner bad"><b>信号不合格,不显示判定</b> — ${d.reason || ""}</div>`;
+  $("verified").classList.toggle("muted", !ok);
+  $("uncal").classList.toggle("muted", !ok);
+
+  $("bpm").textContent = f(d.bpm, 1);
+  $("conf").textContent = f(d.confidence, 2);
+  $("sys").textContent = f(d.systole_ms, 0);
+  $("dia").textContent = f(d.diastole_ms, 0);
+  $("nb").textContent = f(d.n_beats, 0);
+
+  // 未标定的项:质量不合格时干脆不给文字,避免被当成结论
+  const show = v => (ok && v) ? v : "—";
+  $("rhythm").textContent = show(d.rhythm);
+  $("murmur").textContent = show(d.murmur_flag);
+  $("extra").textContent = show(d.extra_flag);
+  $("split").textContent = show(d.split_flag);
+
+  drawWave($("cwave"), d.wave || []);
+  drawEnv($("cenv"), d);
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    render(await r.json());
+  } catch (e) {
+    $("banner").innerHTML =
+      `<div class="banner bad">与后台断开(进程可能已退出)</div>`;
+  }
+}
+setInterval(tick, 500);
+tick();
+addEventListener("resize", () => { if (lastData) render(lastData); });
+</script>

@@ -147,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install -e ".[test]" && python -m pytest tests/ -q   # 118 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 130 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
@@ -176,7 +176,29 @@ S1/S2 主能量;声卡本身也可能在 50–100Hz 以下高通;还有工频、
 > Mac 的 3.5mm 是四段式耳麦口(CTIA),麦克风在**最外圈套环**上。普通三段式
 > (TRS)麦克风插头插进去会被识别成耳机,录不到东西。
 
-**实时采集**(需要麦克风+听诊器):
+**实时监视界面**(推荐):
+
+```bash
+python monitor.py               # 打开浏览器,实时看波形/包络/分段/质量
+python monitor.py --device 2 --port 8800
+```
+
+终端只有一行数字,而贴听诊器时你需要**看见**:波形长什么样、包络上 S1/S2
+标在哪、信号质量为什么不合格。看不见就无从判断是位置不对、贴得不稳,还是
+链路本身有问题。
+
+界面遵循一条设计原则:**不让不可靠的判定看起来权威**——
+
+| | |
+|---|---|
+| 信号质量不合格 | 判定区整体变灰,写明原因,**不显示结论** |
+| 杂音 / S3·S4 / S2 分裂 / 节律 | 一律带「未标定」角标(阈值未在你的设备上标定) |
+| 心率 / 分段 / 收缩期时长 | 真实数据验证过,正常显示 |
+
+零新增依赖(标准库 `http.server` + 前端轮询),只监听 `127.0.0.1`、未做鉴权,
+请勿暴露到公网。
+
+**纯终端实时输出**:
 
 ```bash
 python heartbeat.py
@@ -302,12 +324,16 @@ heartsound/           核心包(pip 可安装)
   segmentation.py       S1/S2 分段与心动周期重建
   features.py           节律、STI、杂音、频谱轮廓、额外音、S2 分裂、HRV
   realtime.py           RealtimeHeartRate 实时采集
+  capture.py            麦克风环形缓冲(终端与界面共用)
+  monitor.py            监视界面的后台:采集线程 + HTTP 服务
+  ui.html               监视界面前端(单页,无外部资源)
   synth.py              合成心音生成器
   classifier.py         特征向量 + HistGradientBoosting 分类基线
   cnn.py                对数梅尔谱 + CNN(可选)
   evalutil.py           AUC、CirCor 加载、**杂音标签的唯一定义**
   cliutil.py            argparse 封装与控制台编码
 
+monitor.py            浏览器实时监视界面(上位机)
 heartbeat.py          兼容垫片 + 实时采集命令行
 checkmic.py           采集链路体检(低频高通/工频/削波/电平/AGC)
 selftest.py           22 项自测,含阴性对照,失败返回非零退出码
