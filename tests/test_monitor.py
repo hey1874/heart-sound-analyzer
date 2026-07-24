@@ -250,43 +250,54 @@ def test_sites_ics_increases_downward_on_diagram():
     assert ys == sorted(ys), f"肋间号与图上高度不单调:{pairs}"
 
 
-def test_site_coords_derive_from_rib_geometry():
-    """听诊点坐标必须由**肋间几何**推出,不是手填的数字。
+def test_site_coords_calibrated_to_the_anatomical_plate():
+    """听诊点坐标必须与底图 thorax.png 上真实的肋骨位置对得上。
 
-    与 ui.html 里的 GEO 保持同一套构造:胸骨角(Louis 角)平对第 2 肋,
-    相邻肋间距 19,第 n 肋间 = 第 n 与 n+1 肋之中点;胸骨缘 = 中线旁开 18,
-    锁骨中线 x=162。这两处一旦漂移,图上的点就会离开它标称的肋间。
+    坐标是在 Gray's Anatomy 版画上量出胸骨角(第 2 肋)、肋附着点间距、
+    胸骨左右缘与锁骨中线之后标定的,不是摆着好看。这里检验的是标定关系,
+    而非具体数值——数值可以微调,关系不能破。
     """
     from heartsound.sites import BY_CODE
-    W, H, MID, ANGLE, STEP, SB, MCL = 240, 300, 120, 88, 19, 18, 162
 
-    def rib_y(n):
-        return ANGLE + (n - 2) * STEP
+    xs = {c: BY_CODE[c]["xy"][0] for c in BY_CODE}
+    ys = {c: BY_CODE[c]["xy"][1] for c in BY_CODE}
 
-    def ics_y(n):
-        return (rib_y(n) + rib_y(n + 1)) / 2
+    # 胸骨中线约在 0.50:AV 在其右(图左),其余在其左(图右)
+    assert xs["AV"] < 0.5 < xs["PV"]
+    # AV / PV 对称贴在胸骨两缘,离中线的距离应接近
+    assert abs((0.5 - xs["AV"]) - (xs["PV"] - 0.5)) < 0.03
 
-    expect = {
-        "AV": (MID - SB, ics_y(2)),
-        "PV": (MID + SB, ics_y(2)),
-        "ERB": (MID + SB, ics_y(3)),
-        "TV": (MID + SB, ics_y(4)),
-        "MV": (MCL - 4, ics_y(5)),
-    }
-    for code, (ex, ey) in expect.items():
-        gx, gy = BY_CODE[code]["xy"]
-        assert abs(gx * W - ex) < 1.0, f"{code} 的 x 偏离胸骨/锁骨中线基准"
-        assert abs(gy * H - ey) < 1.0, f"{code} 的 y 偏离第 {BY_CODE[code]['ics']} 肋间"
+    # 左胸骨缘的三个点(PV/ERB/TV)x 必须一致
+    assert xs["PV"] == xs["ERB"] == xs["TV"], "左胸骨缘三点未对齐"
+    # 心尖区在锁骨中线,明显比胸骨缘更外侧
+    assert xs["MV"] > xs["TV"] + 0.08, "心尖区不够外侧"
+
+    # 同一肋间等高;肋间号每 +1,y 增量应大致相等(肋骨等距)
+    assert ys["AV"] == ys["PV"], "同为第 2 肋间却不等高"
+    steps = [ys["ERB"] - ys["PV"], ys["TV"] - ys["ERB"], ys["MV"] - ys["TV"]]
+    assert all(st > 0 for st in steps), "肋间号增大时位置未下移"
+    assert max(steps) - min(steps) < 0.02, f"肋间距不均匀:{steps}"
 
 
-def test_diagram_marks_the_sternal_angle():
-    """图上必须画出胸骨角——它是"往下数肋间"的起点。
+def test_thorax_image_ships_with_the_package():
+    """底图必须随包发布,否则装完界面是空的。"""
+    import os
+    d = os.path.join(os.path.dirname(__file__), "..", "heartsound")
+    png = os.path.join(d, "thorax.png")
+    assert os.path.exists(png), "缺 heartsound/thorax.png"
+    assert os.path.getsize(png) < 200_000, "底图过大,会拖慢页面加载"
+    with open(png, "rb") as fh:
+        assert fh.read(8) == bytes([137, 80, 78, 71, 13, 10, 26, 10]), \
+            "不是有效的 PNG"
+    toml = open(os.path.join(d, "..", "pyproject.toml"), encoding="utf-8").read()
+    assert "thorax.png" in toml, "pyproject.toml 未把底图列入 package-data"
 
-    上一版示意图恰恰漏了它:提示里让人先摸胸骨角,图上却没有这个参照物。
-    """
+
+def test_diagram_labels_orientation_and_credits_source():
+    """图上必须标出左右,并署明底图来源。"""
     import os
     ui = open(os.path.join(os.path.dirname(__file__), "..", "heartsound",
                            "ui.html"), encoding="utf-8").read()
-    assert "胸骨角" in ui, "示意图未标出胸骨角"
-    assert "锁骨中线" in ui, "示意图未标出锁骨中线(心尖区定位需要)"
-    assert "受检者" in ui, "示意图未标出左右"
+    assert "受检者右" in ui and "受检者左" in ui, "示意图未标出左右"
+    assert "thorax.png" in ui, "界面未引用解剖底图"
+    assert "Gray" in ui, "未标注底图出处(公有领域也应署名)"

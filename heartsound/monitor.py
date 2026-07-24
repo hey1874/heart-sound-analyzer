@@ -315,6 +315,14 @@ def make_handler(state: State):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
+            elif self.path.startswith("/thorax.png"):
+                import os
+                with open(os.path.join(os.path.dirname(__file__),
+                                       "thorax.png"), "rb") as fh:
+                    body = fh.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "max-age=86400")
             elif self.path in ("/", "/index.html"):
                 body = _page()
                 self.send_response(200)
