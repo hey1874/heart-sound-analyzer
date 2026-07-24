@@ -181,8 +181,11 @@ def main(argv):
 
     win_y = y[owner]
     rec_score = np.zeros(len(y))
-    skf = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=0)
-    for k, (tr_r, te_r) in enumerate(skf.split(np.zeros(len(y)), y, pat), 1):
+    # --folds 0:跳过交叉验证,直接走 --save 的全量重训(已知性能时省时间)
+    skf = (StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=0)
+           if folds >= 2 else None)
+    for k, (tr_r, te_r) in enumerate(
+            skf.split(np.zeros(len(y)), y, pat) if skf else [], 1):
         tr_w = np.isin(owner, tr_r)
         te_w = np.isin(owner, te_r)
         print(f"\n--- 第 {k}/{folds} 折: 训练 {tr_w.sum()} 窗 / 测试 {te_w.sum()} 窗 ---")
@@ -211,6 +214,17 @@ def main(argv):
 
     np.savez("cnn_scores.npz", rec_score=rec_score, y=y, pat=pat, name=name)
     print("\n已保存逐条得分 -> cnn_scores.npz")
+
+    if "--save" in argv:
+        # 交叉验证只用于估性能;要部署或做外部验证,需在**全量**数据上重训
+        out = argv[argv.index("--save") + 1]
+        print(f"\n在全部 {len(y)} 条录音({len(S)} 窗)上重训并保存 -> {out}")
+        _, model = run_fold(S, win_y, S[:1], epochs, device, seed=0, log=True)
+        torch.save({"state_dict": model.state_dict(),
+                    "n_mels": int(S.shape[1]), "frames": int(S.shape[2]),
+                    "trained_on": os.path.abspath(directory),
+                    "n_recordings": int(len(y))}, out)
+        print("完成。加载见 cnn.load_model()")
     return 0
 
 

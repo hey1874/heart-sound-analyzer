@@ -27,6 +27,11 @@ CirCor 内部 AUC,这不全是模型的问题**。为了把「域偏移」和「
 
 用法:
     python external_eval.py <2016目录> [--cnn cnn_circor.pt] [--circor <CirCor目录>]
+                            [--per-subset 250]   # 每个来源子库最多取多少条
+
+抽样说明:默认每子库上限 250 条。全量 3240 条里子库 e 一家占 2141 条,全跑
+等于反复测同一个来源;而 AUC 的标准误在约 165 阳性/635 阴性时已 ≈0.02,足以
+分辨本验证关心的差异。设 --per-subset 0 可跑全量。
 
 目录约定:<2016目录>/REFERENCE-{a..f}.csv + <2016目录>/data/*.wav
 标签 -1=正常 / 1=异常,统一映射为 0/1。
@@ -58,7 +63,8 @@ def auc(score: np.ndarray, label: np.ndarray) -> float:
     return float(trapz(tpr, fpr))
 
 
-def load_2016(directory: str, cnn_path: str | None = None):
+def load_2016(directory: str, cnn_path: str | None = None,
+              per_subset: int = 250):
     """提取 2016 的工程特征(以及可选的 CNN 分数)。"""
     import soundfile as sf
     an = HeartSoundAnalyzer()
@@ -76,11 +82,22 @@ def load_2016(directory: str, cnn_path: str | None = None):
         ref = os.path.join(directory, f"REFERENCE-{sub}.csv")
         if not os.path.exists(ref):
             continue
-        for r in csv.reader(open(ref)):
-            if len(r) < 2:
-                continue
-            rows.append((sub, r[0].strip(), int(r[1].strip())))
-    print(f"标签共 {len(rows)} 条")
+        got = [(sub, r[0].strip(), int(r[1].strip()))
+               for r in csv.reader(open(ref)) if len(r) >= 2]
+        if per_subset and len(got) > per_subset:
+            # 分层抽样:按原始阳性率保留,不打乱类别比例
+            pos = [g for g in got if g[2] == 1]
+            neg = [g for g in got if g[2] != 1]
+            frac = per_subset / len(got)
+            rng = np.random.default_rng(0)
+            keep = ([pos[i] for i in rng.permutation(len(pos))[
+                        :max(1, round(len(pos) * frac))]]
+                    + [neg[i] for i in rng.permutation(len(neg))[
+                        :max(1, round(len(neg) * frac))]])
+            print(f"  子库 {sub}: {len(got)} -> 抽样 {len(keep)} 条")
+            got = keep
+        rows.extend(got)
+    print(f"合计 {len(rows)} 条")
 
     X, y, sub_of, names, rel, cnn_s = [], [], [], [], [], []
     for i, (sub, stem, lab) in enumerate(rows):
@@ -117,6 +134,8 @@ def main(argv):
     cnn_path = argv[argv.index("--cnn") + 1] if "--cnn" in argv else None
     circor = argv[argv.index("--circor") + 1] if "--circor" in argv else None
     cache = argv[argv.index("--cache") + 1] if "--cache" in argv else "ext2016.npz"
+    per_sub = (int(argv[argv.index("--per-subset") + 1])
+               if "--per-subset" in argv else 250)
 
     if os.path.exists(cache):
         d = np.load(cache, allow_pickle=True)
@@ -124,7 +143,7 @@ def main(argv):
         cnn_s = d["cnn"] if "cnn" in d and d["cnn"].size else None
         print(f"从缓存读取 {cache}")
     else:
-        X, y, sub, names, rel, cnn_s = load_2016(directory, cnn_path)
+        X, y, sub, names, rel, cnn_s = load_2016(directory, cnn_path, per_sub)
         np.savez_compressed(cache, X=X, y=y, sub=sub, names=names, rel=rel,
                             cnn=cnn_s if cnn_s is not None else np.array([]))
     print(f"\n可用 {len(y)} 条 / 异常 {int(y.sum())} / 正常 {int((1 - y).sum())}"
