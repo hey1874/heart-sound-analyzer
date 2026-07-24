@@ -9,6 +9,8 @@
 import json
 
 import numpy as np
+import re
+from pathlib import Path
 import pytest
 
 from heartsound import HeartSoundAnalyzer
@@ -301,3 +303,107 @@ def test_diagram_labels_orientation_and_credits_source():
     assert "受检者右" in ui and "受检者左" in ui, "示意图未标出左右"
     assert "thorax.png" in ui, "界面未引用解剖底图"
     assert "Gray" in ui, "未标注底图出处(公有领域也应署名)"
+
+
+def _ui_css():
+    from heartsound import monitor
+    s = (Path(monitor.__file__).parent / "ui.html").read_text(encoding="utf-8")
+    return s[s.index("<style>") + 7:s.index("</style>")]
+
+
+def test_ui_css_is_structurally_valid():
+    """浏览器遇到非法 CSS 只会静默丢弃整条规则,没有任何报错。
+
+    起因是真出过一次:`:root[data-theme="dark"] .torso image, @media (...){...}`
+    ——@media 混进了选择器列表。规则被整条丢掉,暗色主题下白底版画就直接
+    糊在深色卡片上。测试跑得再多也发现不了,因为它根本不影响 Python。
+    """
+    css = _ui_css()
+    assert css.count("{") == css.count("}"), "花括号不配平"
+
+    depth = 0
+    for i, ch in enumerate(css):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif css.startswith("@media", i):
+            assert depth == 0, f"@media 嵌在规则内部(偏移 {i})"
+        assert depth >= 0, f"多余的右花括号(偏移 {i})"
+
+    assert not re.search(r"[^{}\n]*,\s*\n?\s*@media", css), \
+        "@media 出现在选择器列表里——整条规则会被丢弃"
+    for m in re.finditer(r"([^{}]+)\{\s*\}", css):
+        raise AssertionError(f"空规则(多半是删改的残留): {m.group(1).strip()[:60]}")
+
+
+def test_ui_defines_plate_filter_for_every_theme():
+    """底图是白底黑线,暗色主题必须反相,否则是一块刺眼白板。
+
+    四套主题定义(:root、prefers-color-scheme、data-theme=light/dark)必须
+    都给 --plate-filter 赋值:漏掉任何一套,那套主题下就会继承错的值。
+    """
+    css = _ui_css()
+    assert len(re.findall(r"--plate-filter\s*:", css)) == 4, \
+        "四套主题都要定义 --plate-filter"
+    assert re.search(r"\.torso image\{[^}]*filter:var\(--plate-filter", css), \
+        "底图未套用 --plate-filter"
+    dark = re.findall(r"--plate-filter:\s*([^;}]+)", css)
+    assert sum("invert" in v for v in dark) == 2, "两套暗色主题都要反相"
+
+
+def test_demo_mode_makes_no_network_requests():
+    """演示页没有后端,而 fetch 用的是相对路径——不守卫就会打到宿主站点上。
+
+    必须按块作用域判断,不能只在 fetch 之前找 `__DEMO__` 字样:文件里别处
+    也出现这个词,那样写出来的断言恒真(第一版就是这么漏的)。
+    """
+    from heartsound import monitor
+    s = (Path(monitor.__file__).parent / "ui.html").read_text(encoding="utf-8")
+    js = s[s.index("</style>"):]
+
+    def scan(tokens):
+        """扫一遍 js,对每个 token 记录它所处的块头栈。"""
+        stack, hits, pos = [], [], 0
+        for m in re.finditer(r"[{}]|" + tokens, js):
+            tok = m.group(0)
+            if tok == "{":
+                stack.append(js[pos:m.start()])      # 这一层块的"头部"
+            elif tok == "}":
+                if stack:
+                    stack.pop()
+            else:
+                hits.append((m.start(), tok, list(stack)))
+            pos = m.end()
+        return hits
+
+    def is_guarded(stack):
+        return any("!window.__DEMO__" in h for h in stack)
+
+    def line(at):
+        return js.count("\n", 0, at) + 1
+
+    fetches = scan(r"fetch\(")
+    assert fetches, "没找到任何 fetch,测试本身失效了"
+
+    for at, _, stack in fetches:
+        if is_guarded(stack):
+            continue
+        # 没被词法守卫的,只要它所在函数的每个调用点都被守卫,也算安全
+        # (tick() 就是这种:fetch 在函数体里,setInterval/首次调用都在守卫内)
+        fn = None
+        for head in reversed(stack):
+            m = re.search(r"function\s+(\w+)\s*\(", head)
+            if m:
+                fn = m.group(1)
+                break
+        assert fn, f"第 {line(at)} 行(js 内)的 fetch 既未被守卫,也不在具名函数里"
+
+        sites = [(a, s) for a, tok, s in scan(rf"\b{fn}\(")
+                 if not re.search(rf"function\s+{fn}\s*\($", js[:a + len(fn) + 1])]
+        sites = [(a, s) for a, s in sites
+                 if not js[:a].rstrip().endswith("function")]
+        assert sites, f"{fn}() 里有 fetch 却找不到调用点"
+        for a, s in sites:
+            assert is_guarded(s), (
+                f"{fn}() 内有 fetch,但第 {line(a)} 行(js 内)的调用点未被守卫")

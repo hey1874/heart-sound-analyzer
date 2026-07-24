@@ -16,21 +16,25 @@
   --accent:#0d7f8c;                    /* 包络描线 */
   --ok:#1d7f4f; --warn:#9a6206; --bad:#b3372a;
   --s1:#1d7f4f; --s2:#9a6206;
+  --plate-filter:none;
 }
 @media (prefers-color-scheme:dark){
   :root{--bg:#0f1315;--card:#171c1f;--fg:#e9eff1;--fg-2:#9aa8ad;--fg-3:#66747a;
         --line:#252d31;--track:#222a2e;--accent:#3ec9d8;
-        --ok:#4bc98a;--warn:#e0a83f;--bad:#f0685c;--s1:#4bc98a;--s2:#e0a83f;}
+        --ok:#4bc98a;--warn:#e0a83f;--bad:#f0685c;--s1:#4bc98a;--s2:#e0a83f;
+        --plate-filter:invert(1) brightness(1.3);}
 }
 :root[data-theme="light"]{
   --bg:#f4f6f7;--card:#fff;--fg:#151a1d;--fg-2:#5a666c;--fg-3:#8d999f;
   --line:#e2e7e9;--track:#e9edef;--accent:#0d7f8c;
   --ok:#1d7f4f;--warn:#9a6206;--bad:#b3372a;--s1:#1d7f4f;--s2:#9a6206;
+  --plate-filter:none;
 }
 :root[data-theme="dark"]{
   --bg:#0f1315;--card:#171c1f;--fg:#e9eff1;--fg-2:#9aa8ad;--fg-3:#66747a;
   --line:#252d31;--track:#222a2e;--accent:#3ec9d8;
   --ok:#4bc98a;--warn:#e0a83f;--bad:#f0685c;--s1:#4bc98a;--s2:#e0a83f;
+  --plate-filter:invert(1) brightness(1.3);
 }
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -54,14 +58,14 @@ body{background:var(--bg);color:var(--fg);font:15px/1.7 var(--sans);
 @media(max-width:640px){.site{grid-template-columns:1fr}}
 .torso{width:100%;height:auto;display:block}
 .torso .halo{fill:var(--accent);opacity:.18}
-.torso image{opacity:.92}
-:root[data-theme="dark"] .torso image,
-@media (prefers-color-scheme:dark){.torso image{filter:invert(1) hue-rotate(180deg);opacity:.78}}
+/* 底图是黑线白底的版画;暗色主题下反相,免得在深色页面上戳出一块白。
+   注意 @media 不能写进选择器列表——那样整条规则会被丢弃,并连累后续样式。
+   这里用一个变量承载滤镜,由主题分别赋值。 */
+.torso image{opacity:.92;filter:var(--plate-filter,none)}
 .torso .dot{fill:var(--card);stroke:var(--accent);stroke-width:2.5;cursor:pointer}
 .torso .pt.on .dot{fill:var(--accent);stroke:var(--accent)}
 .torso .pt .lbl{font:700 11px var(--sans);fill:var(--fg-2)}
 .torso .pt.on .lbl{fill:var(--accent)}
-.torso .dot.on{fill:var(--accent);stroke:var(--accent)}
 .torso .dot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .torso .side{font:600 11px var(--sans);fill:var(--fg-3);pointer-events:none}
 .viewnote{font-size:12px;color:var(--fg-3);text-align:center;margin-top:6px;
@@ -597,9 +601,12 @@ async function tick() {
   }
 }
 drawColorbar();
-fetch("/api/sites").then(r => r.json()).then(d => {
-  SITES = d; drawTorso(null); renderSiteList(null);
-}).catch(() => {});
-if (!window.__DEMO__) { setInterval(tick, 500); tick(); }
+// 演示页自带 SITES 且没有后端,相对路径会打到宿主站点上,必须一并守卫
+if (!window.__DEMO__) {
+  fetch("/api/sites").then(r => r.json()).then(d => {
+    SITES = d; drawTorso(null); renderSiteList(null);
+  }).catch(() => {});
+  setInterval(tick, 500); tick();
+}
 addEventListener("resize", () => { if (last) render(last); });
 </script>
