@@ -125,6 +125,11 @@ class State:
         self.lock = threading.Lock()
         self.data: dict = {"status": "starting"}
         self.stop = False
+        # 当前听诊区。杂音是位置依赖的(多区取最大可把患者级 AUC 从 0.701
+        # 提到 0.762),而且 AV/PV/TV/MV 正是 CirCor 的标签——标上位置,
+        # 采到的数据才能直接喂给 calibrate.py。
+        self.site: str = "MV"
+        self.best: dict[str, float] = {}      # 各区见过的最好 SQI
 
     def set(self, d: dict) -> None:
         with self.lock:
@@ -132,7 +137,26 @@ class State:
 
     def get(self) -> dict:
         with self.lock:
-            return self.data
+            d = dict(self.data)
+            d["site"] = self.site
+            d["best_sqi"] = dict(self.best)
+            return d
+
+    def set_site(self, code: str) -> bool:
+        from .sites import BY_CODE
+        if code not in BY_CODE:
+            return False
+        with self.lock:
+            self.site = code
+        return True
+
+    def note_quality(self, sqi: float | None) -> None:
+        """记下当前听诊区见过的最好信号质量,便于"挪一挪找位置"。"""
+        if sqi is None:
+            return
+        with self.lock:
+            if sqi > self.best.get(self.site, 0.0):
+                self.best[self.site] = round(float(sqi), 3)
 
 
 def _build_payload(an: HeartSoundAnalyzer, res: dict, fs: int,
@@ -223,6 +247,7 @@ def capture_loop(state: State, device, window_s: float, hop_s: float,
                 state.set({"status": "error",
                            "message": f"分析出错:{type(e).__name__}: {e}"})
                 continue
+            state.note_quality((res.get("sqi") or {}).get("sqi"))
             state.set(_build_payload(an, res, cap.fs, cap.device_name,
                                      cap.xruns))
     finally:
@@ -271,7 +296,21 @@ def demo_loop(state: State, hop_s: float, conf_gate: float) -> None:
 def make_handler(state: State):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):                               # noqa: N802
-            if self.path.startswith("/api/state"):
+            if self.path.startswith("/api/sites"):
+                from .sites import FIND_TIP, ORDER, SITES
+                body = json.dumps({"sites": SITES, "order": ORDER,
+                                   "tip": FIND_TIP},
+                                  ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+            elif self.path.startswith("/api/site?"):
+                from urllib.parse import parse_qs, urlparse
+                code = parse_qs(urlparse(self.path).query).get("code", [""])[0]
+                okc = state.set_site(code)
+                body = json.dumps({"ok": okc, "site": state.site}).encode()
+                self.send_response(200 if okc else 400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+            elif self.path.startswith("/api/state"):
                 body = json.dumps(state.get(), ensure_ascii=False).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

@@ -1,0 +1,84 @@
+"""
+sites.py — 标准心脏听诊区。
+
+为什么这不只是"给人看的说明"
+----------------------------
+杂音是**位置依赖**的:实测多听诊区取最大值能把患者级 AUC 从 0.701 提到
+0.762(见 docs/VALIDATION.md 第 7 节),是投入产出比最高的一项改进,而且
+不需要任何额外硬件——换个位置再录一次就行。
+
+而这四个代号(AV / PV / TV / MV)**正是 CirCor 数据集的听诊区标签**。所以
+录音时标上位置,采集到的数据才能直接喂给 `calibrate.py` 做标定;不标位置,
+那条路就断了。
+
+⚠️ 本模块只提供**解剖定位的参考描述**。工具无法判断你是否真的贴在了正确
+   位置——它只能告诉你信号好不好。定位要靠解剖标志(胸骨角 = 第 2 肋间)
+   自己确认。
+
+来源
+----
+- 心脏听诊区_百度百科 / 《物理诊断学》
+- Kenhub, Heart auscultation: Anatomy and technique
+- Oliveira J. et al., The CirCor DigiScope Dataset, IEEE JBHI 2022(标签体系)
+"""
+
+from __future__ import annotations
+
+# code 与 CirCor 的听诊区标签一致,便于直接对接 calibrate.py
+SITES = [
+    {
+        "code": "AV",
+        "name": "主动脉瓣区",
+        "en": "Aortic",
+        "landmark": "胸骨右缘第 2 肋间",
+        "listen_for": "主动脉瓣狭窄的喷射性收缩期杂音(向颈部放射)",
+        # 归一化到胸廓示意图的坐标(0..1),x 向右为受检者的左侧
+        "xy": (0.385, 0.30),
+    },
+    {
+        "code": "PV",
+        "name": "肺动脉瓣区",
+        "en": "Pulmonic",
+        "landmark": "胸骨左缘第 2 肋间",
+        "listen_for": "肺动脉瓣病变;S2 分裂在此最清楚",
+        "xy": (0.615, 0.30),
+    },
+    {
+        "code": "ERB",
+        "name": "主动脉瓣第二区",
+        "en": "Erb",
+        "landmark": "胸骨左缘第 3 肋间",
+        "listen_for": "主动脉瓣反流的舒张期递减型杂音",
+        "xy": (0.615, 0.42),
+        "optional": True,
+    },
+    {
+        "code": "TV",
+        "name": "三尖瓣区",
+        "en": "Tricuspid",
+        "landmark": "胸骨左缘第 4–5 肋间",
+        "listen_for": "三尖瓣反流、室间隔缺损;右心声音在此最强",
+        "xy": (0.60, 0.575),
+    },
+    {
+        "code": "MV",
+        "name": "二尖瓣区(心尖)",
+        "en": "Mitral",
+        "landmark": "第 5 肋间,左锁骨中线内 0.5–1 cm",
+        "listen_for": "二尖瓣反流的全收缩期杂音(向腋下放射);S3 在此最清楚",
+        "xy": (0.73, 0.66),
+    },
+]
+
+# 常规听诊顺序:二尖瓣 → 肺动脉瓣 → 主动脉瓣 → 主动脉瓣第二区 → 三尖瓣
+ORDER = ["MV", "PV", "AV", "ERB", "TV"]
+
+BY_CODE = {s["code"]: s for s in SITES}
+
+# CirCor 只用这四个(不含 Erb),对接标定时以这四个为准
+CIRCOR_CODES = ["AV", "PV", "TV", "MV"]
+
+FIND_TIP = (
+    "找位置的办法:先摸到**胸骨角**(胸骨上段的横向骨嵴),它平对第 2 肋,"
+    "紧邻其下的肋间就是第 2 肋间;由此往下数即可。"
+)
