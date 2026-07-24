@@ -138,12 +138,34 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install pytest && python -m pytest tests/ -q      # 94 passed
+pip install pytest && python -m pytest tests/ -q      # 102 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
 崩溃、不同采样率结论一致、门控自洽、真杂音不被挡),而非具体数值。开发中它
 实际发现了 4 个缺陷。
+
+**先做链路体检**(接上硬件后、正式录音前):
+
+```bash
+python checkmic.py --list      # 列出输入设备
+python checkmic.py             # 录 5 秒环境声,检查链路
+```
+
+「听诊器 → 咪头 → 3.5mm → 声卡」这条链路上有几个坑**不会报错**,只会让你拿到
+"能出数但全是错的"结果:系统降噪/麦克风增强会在 100Hz 以上做高通,正好砍掉
+S1/S2 主能量;声卡本身也可能在 50–100Hz 以下高通;还有工频、削波、AGC。
+`checkmic.py` 从环境底噪的频谱形状反推这些问题:
+
+```
+✅ 输入电平: 峰值 -18.3 dBFS,动态范围合适
+❌ 低频响应: 20-60Hz 比 200-400Hz 低 14 dB,链路存在高通。S1/S2 主能量在
+             20-150Hz,会被砍掉。→ 关掉系统的降噪/麦克风增强;换低频平直的声卡
+✅ 工频干扰: 50/60Hz 占 3%,干净
+```
+
+> Mac 的 3.5mm 是四段式耳麦口(CTIA),麦克风在**最外圈套环**上。普通三段式
+> (TRS)麦克风插头插进去会被识别成耳机,录不到东西。
 
 **实时采集**(需要麦克风+听诊器):
 
@@ -259,6 +281,7 @@ python predict.py --selftest          # 合成杂音信号自检
 ```
 heartbeat.py          核心算法 HeartSoundAnalyzer + 实时采集 RealtimeHeartRate
 synth.py              合成心音生成器(自测与 ML 管线验证用)
+checkmic.py           采集链路体检(低频高通/工频/削波/电平/AGC)
 selftest.py           22 项自测,含阴性对照,失败返回非零退出码
 calibrate.py          在真实标注数据上标定阈值 + 验证分段/杂音/分类器
 classifier.py         特征向量 + HistGradientBoosting 分类基线 + 数据加载
