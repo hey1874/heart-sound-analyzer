@@ -171,3 +171,50 @@ def test_all_charts_share_one_time_axis():
         assert all(0.0 <= v <= 1.0 for v in p[k]), f"{k} 越界"
     # 三张图的数据量都非零且各自自洽
     assert p["wave"]["n"] > 0 and p["env"]["n"] > 0 and p["spec"]["w"] > 0
+
+
+# --- 听诊区 -----------------------------------------------------------------
+
+def test_sites_match_circor_labels():
+    """AV/PV/TV/MV 必须与 CirCor 的听诊区标签一致。
+
+    这不是巧合而是设计:录音时标上位置,数据才能直接喂给 calibrate.py。
+    对不上,那条标定路径就断了。
+    """
+    from heartsound.sites import BY_CODE, CIRCOR_CODES, ORDER, SITES
+    assert set(CIRCOR_CODES) <= {s["code"] for s in SITES}
+    assert set(ORDER) == {s["code"] for s in SITES}, "顺序表与站点表不一致"
+    for s in SITES:
+        assert s["landmark"] and s["listen_for"], f"{s['code']} 缺定位或听诊说明"
+        x, y = s["xy"]
+        assert 0 <= x <= 1 and 0 <= y <= 1, f"{s['code']} 示意图坐标越界"
+    # 解剖左右:主动脉瓣区在胸骨**右**缘,肺动脉瓣区在**左**缘
+    assert BY_CODE["AV"]["xy"][0] < 0.5 < BY_CODE["PV"]["xy"][0]
+    # 心尖区最靠下、最靠左
+    assert BY_CODE["MV"]["xy"][1] == max(s["xy"][1] for s in SITES)
+
+
+def test_state_tracks_site_and_best_quality():
+    """切换听诊区后,各区的最佳 SQI 要分别记账——这是"挪一挪找位置"的依据。"""
+    from heartsound.monitor import State
+    st = State()
+    assert st.site == "MV"
+    st.note_quality(0.5)
+    st.note_quality(0.7)
+    assert st.set_site("AV") is True
+    assert st.set_site("不存在") is False, "非法听诊区必须拒绝"
+    st.note_quality(0.9)
+    st.note_quality(0.3)                      # 更差的不该覆盖
+    d = st.get()
+    assert d["site"] == "AV"
+    assert d["best_sqi"] == {"MV": 0.7, "AV": 0.9}
+
+
+def test_state_get_is_a_snapshot():
+    """get() 必须返回副本,调用方改它不能影响内部状态。"""
+    from heartsound.monitor import State
+    st = State()
+    st.set({"status": "ok"})
+    d = st.get()
+    d["status"] = "tampered"
+    assert st.get()["status"] == "ok"
