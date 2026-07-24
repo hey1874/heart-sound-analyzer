@@ -147,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install -e ".[test]" && python -m pytest tests/ -q   # 154 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 156 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
@@ -200,7 +200,9 @@ python monitor.py --device 2 --port 8800
 | 二尖瓣区 MV(心尖) | 第 5 肋间,左锁骨中线内 0.5–1 cm | 二尖瓣反流(向腋下放射);S3 最清楚 |
 
 找位置的办法:先摸到**胸骨角**(胸骨上段的横向骨嵴),它平对第 2 肋,紧邻其下
-就是第 2 肋间,由此往下数。
+就是第 2 肋间,由此往下数。示意图上画出了胸骨角、肋骨、锁骨中线与心脏轮廓,
+听诊点的坐标**由肋间几何推算**(胸骨角平对第 2 肋、肋间距 19、第 n 肋间取
+第 n 与 n+1 肋之中点),不是手工摆的。
 
 > ⚠️ 示意图为**正面视角**(面对受检者),因此**图的右边 = 受检者的左侧**
 > ——主动脉瓣区在胸骨右缘,画在图的左侧。图上已标出左右与肋间刻度,但
