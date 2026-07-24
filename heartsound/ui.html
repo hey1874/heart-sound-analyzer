@@ -51,6 +51,18 @@ body{background:var(--bg);color:var(--fg);font:15px/1.7 var(--sans);
 .pip.live{animation:p 1.8s ease-in-out infinite}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
 @media (prefers-reduced-motion:reduce){.pip.live{animation:none}}
+.elapsed{font-family:var(--num);font-variant-numeric:tabular-nums;
+         font-weight:500;color:var(--fg-2)}
+.acts{display:flex;gap:8px}
+.btn{font:600 14px/1 var(--sans);padding:10px 16px;border-radius:8px;
+     border:1px solid var(--line);background:var(--card);color:var(--fg);
+     cursor:pointer}
+.btn:hover:not(:disabled){filter:brightness(1.08)}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* 禁用态必须一眼可辨:两个按钮总有一个不可用,看不出来就会反复点 */
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn.go{background:var(--ok);border-color:var(--ok);color:#fff}
+.btn.stop{background:var(--bad);border-color:var(--bad);color:#fff}
 
 .site{display:grid;grid-template-columns:300px 1fr;gap:22px;align-items:start;
       background:var(--card);border:1px solid var(--line);border-radius:10px;
@@ -152,7 +164,14 @@ code{font-family:var(--num);font-size:13px;background:var(--track);
   <div class="bar">
     <span class="brand">心音监视</span>
     <span class="dev" id="dev">连接中…</span>
-    <span class="state"><span class="pip" id="pip"></span><span id="stateTxt">—</span></span>
+    <span class="state"><span class="pip" id="pip"></span><span id="stateTxt">—</span>
+      <span class="elapsed" id="elapsed"></span></span>
+    <span class="acts">
+      <button type="button" class="btn go" id="btnGo"
+              onclick="setCapture(true)">开始采集</button>
+      <button type="button" class="btn stop" id="btnStop"
+              onclick="setCapture(false)" disabled>停止采集</button>
+    </span>
   </div>
 
   <div class="site">
@@ -520,9 +539,61 @@ function renderSiteList(best) {
 
 let last = null;
 
+// 采集开关。后端停止时会**真的关闭输入流**(录音指示灯灭、设备让出),
+// 所以这不是"暂停画面",按下去是有实际后果的。
+let capturing = false;
+
+function paintCapture(d) {
+  if (d && "capture" in d) capturing = !!d.capture;
+  $("btnGo").disabled = capturing;
+  $("btnStop").disabled = !capturing;
+  const t = d && d.elapsed_s;
+  $("elapsed").textContent = capturing && t
+    ? `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`
+    : "";
+}
+
+async function setCapture(on) {
+  $("btnGo").disabled = $("btnStop").disabled = true;   // 防连点
+  if (!window.__DEMO__) {
+    try {
+      // 必须是 POST:开麦克风是有副作用的操作,不能让预取之类的 GET 触发
+      await fetch(`/api/capture?on=${on ? 1 : 0}`, { method: "POST" });
+    } catch (e) { /* tick() 会把断开状态显示出来 */ }
+    tick();
+    return;
+  }
+  capturing = on;                       // 演示页没有后端,只切本地状态
+  render(Object.assign({}, last || {}, {
+    status: on ? (last && last.wave ? "ok" : "idle") : "stopped",
+    capture: on,
+  }));
+}
+
 function render(d) {
   last = d;
   const pip = $("pip"), st = $("stateTxt");
+  paintCapture(d);
+
+  // 未开始 / 已停止:这两种不是故障,不能拿"信号不合格"的红条去吓人
+  const idle = d.status === "idle" || (d.status === "stopped" && !d.wave);
+  const stopped = d.status === "stopped" && !!d.wave;
+  if (idle) {
+    $("dev").textContent = "";
+    pip.style.background = cssv("--fg-3"); pip.classList.remove("live");
+    st.textContent = "未开始"; st.style.color = cssv("--fg-2");
+    $("gate").classList.add("on");
+    $("gate").style.borderLeftColor = cssv("--fg-3");
+    $("gateTitle").style.color = cssv("--fg");
+    $("gateTitle").textContent = "尚未开始采集";
+    $("gateWhy").textContent =
+      "麦克风还没有打开。把听诊器贴到上面选中的听诊区,再按右上角「开始采集」。";
+    $("tierA").classList.add("dimmed");
+    $("tierB").classList.add("dimmed");
+    return;
+  }
+  $("gate").style.borderLeftColor = "";
+  $("gateTitle").style.color = "";
 
   if (d.status === "error") {
     pip.style.background = cssv("--bad"); pip.classList.remove("live");
@@ -532,7 +603,7 @@ function render(d) {
     $("gateWhy").textContent = d.message || "";
     return;
   }
-  if (d.status !== "ok") {
+  if (d.status !== "ok" && !stopped) {
     $("dev").textContent = d.device ? `${d.device} · ${d.fs} Hz` : "";
     pip.style.background = cssv("--warn"); pip.classList.add("live");
     st.textContent = "缓冲中"; st.style.color = cssv("--warn");
@@ -543,10 +614,13 @@ function render(d) {
   const ok = d.reliable;
   $("dev").textContent = `${d.device} · ${d.fs} Hz`
     + (d.xruns ? ` · 溢出 ${d.xruns}` : "");
-  pip.style.background = ok ? cssv("--ok") : cssv("--bad");
-  pip.classList.add("live");
-  st.textContent = ok ? "采集中" : "信号不清";
-  st.style.color = ok ? cssv("--ok") : cssv("--bad");
+  // 已停止时保留最后一帧继续显示——停下来往往正是为了回看刚才采到的东西
+  pip.style.background = stopped ? cssv("--fg-3")
+                                 : (ok ? cssv("--ok") : cssv("--bad"));
+  pip.classList.toggle("live", !stopped);
+  st.textContent = stopped ? "已停止" : (ok ? "采集中" : "信号不清");
+  st.style.color = stopped ? cssv("--fg-2")
+                           : (ok ? cssv("--ok") : cssv("--bad"));
 
   $("gate").classList.toggle("on", !ok);
   if (!ok) $("gateWhy").textContent = d.reason || "";
@@ -592,9 +666,15 @@ async function tick() {
   try { render(await (await fetch("/api/state", { cache: "no-store" })).json()); }
   catch (e) {
     $("pip").style.background = cssv("--bad");
+    $("pip").classList.remove("live");
     $("stateTxt").textContent = "已断开";
     $("stateTxt").style.color = cssv("--bad");
+    $("elapsed").textContent = "";
+    // 后台没了,两个按钮都点不动——留着可点只会让人以为还有救
+    $("btnGo").disabled = $("btnStop").disabled = true;
     $("gate").classList.add("on");
+    $("gate").style.borderLeftColor = "";
+    $("gateTitle").style.color = "";
     $("gateTitle").textContent = "与后台断开";
     $("gateWhy").textContent =
       "采集进程可能已退出。回到终端查看,或重新运行 python monitor.py";

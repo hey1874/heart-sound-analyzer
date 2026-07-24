@@ -12,6 +12,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import http.client
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -464,3 +468,266 @@ def test_inline_event_handlers_dont_break_out_of_their_attribute():
             f"on{m.group(1)} 的属性被提前闭合(其后是 {nxt!r}):"
             f" {src[m.start():m.end() + 20].strip()[:80]}")
     assert found, "没找到内联 on* 属性,测试本身失效了"
+
+
+# --------------------------------------------------------------------------
+# 采集开关
+# --------------------------------------------------------------------------
+
+def test_capture_is_off_until_someone_asks_for_it():
+    """启动进程不等于打开麦克风。"""
+    from heartsound.monitor import State
+    st = State()
+    assert st.capture is False
+    assert st.get()["status"] == "idle"
+    assert st.get()["capture"] is False
+    assert State(capture=True).capture is True
+
+
+def test_set_capture_transitions_and_keeps_the_last_frame():
+    from heartsound.monitor import State
+    st = State()
+    st.set_capture(True)
+    assert st.capture and st.t0 is not None
+    assert st.get()["status"] == "waiting"
+
+    st.set({"status": "ok", "bpm": 72.0, "wave": {"n": 3}})
+    st.set_capture(False)
+    d = st.get()
+    assert d["status"] == "stopped", "停止后状态要变"
+    # 停下来往往正是为了回看刚采到的东西,数据不能跟着清掉
+    assert d["bpm"] == 72.0 and d["wave"] == {"n": 3}
+    assert d["elapsed_s"] == 0.0 and st.t0 is None
+
+    st.set_capture(False)          # 重复停止应当无副作用
+    assert st.get()["bpm"] == 72.0
+
+
+def test_elapsed_counts_only_while_capturing():
+    from heartsound.monitor import State
+    st = State()
+    assert st.get()["elapsed_s"] == 0.0
+    st.set_capture(True)
+    st.t0 -= 65.0                  # 假装已经采了 65 秒
+    assert 64.0 < st.get()["elapsed_s"] < 66.0
+    st.set_capture(False)
+    assert st.get()["elapsed_s"] == 0.0
+
+
+class _FakeCap:
+    """替身麦克风:记录开/关次数,好断言输入流真的被释放了。"""
+
+    opened = 0
+    closed = 0
+
+    def __init__(self, device=None, window_s=6.0):
+        self.fs, self.device_name, self.xruns = 8000, "fake", 0
+        self._n = 0
+
+    def start(self):
+        _FakeCap.opened += 1
+        return self
+
+    def stop(self):
+        _FakeCap.closed += 1
+
+    def snapshot(self, min_new_s=0.0):
+        self._n += 1
+        if self._n < 2:
+            return None
+        rng = np.random.default_rng(0)
+        return rng.normal(0, 0.01, 8000 * 4).astype(np.float32)
+
+
+def test_capture_loop_opens_and_closes_the_device_with_the_switch(monkeypatch):
+    """停止必须**关闭输入流**,而不是继续读着不分析。
+
+    差别是实的:关掉之后系统的录音指示灯会灭,设备也让给别的程序。
+    """
+    from heartsound import monitor
+    monkeypatch.setattr(monitor, "MicCapture", _FakeCap)
+    _FakeCap.opened = _FakeCap.closed = 0
+
+    st = monitor.State()
+    t = threading.Thread(target=monitor.capture_loop, daemon=True,
+                         args=(st, None, 4.0, 0.1, 0.30))
+    t.start()
+    try:
+        time.sleep(0.3)
+        assert _FakeCap.opened == 0, "没人按开始,不该打开设备"
+
+        st.set_capture(True)
+        deadline = time.time() + 5
+        while _FakeCap.opened == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.opened == 1, "按下开始后应打开设备"
+
+        st.set_capture(False)
+        deadline = time.time() + 5
+        while _FakeCap.closed == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.closed == 1, "按下停止后应关闭设备,而不是空转"
+
+        st.set_capture(True)       # 再开一次应当是**新**的缓冲
+        deadline = time.time() + 5
+        while _FakeCap.opened < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.opened == 2
+    finally:
+        st.stop = True
+        st.set_capture(False)
+        t.join(timeout=3)
+
+
+def test_capture_loop_gives_up_after_a_device_error(monkeypatch):
+    """打不开设备时必须落回停止态,不能每 50ms 重试一次。"""
+    from heartsound import monitor
+
+    class _Boom:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            _Boom.tries += 1
+            raise OSError("no such device")
+
+    _Boom.tries = 0
+    monkeypatch.setattr(monitor, "MicCapture", _Boom)
+    st = monitor.State()
+    t = threading.Thread(target=monitor.capture_loop, daemon=True,
+                         args=(st, None, 4.0, 0.1, 0.30))
+    t.start()
+    try:
+        st.set_capture(True)
+        time.sleep(0.6)
+        assert _Boom.tries == 1, f"只该试一次,实际 {_Boom.tries} 次"
+        assert st.capture is False
+        d = st.get()
+        assert d["status"] == "error" and "no such device" in d["message"]
+    finally:
+        st.stop = True
+        t.join(timeout=3)
+
+
+def _serve_state(st):
+    """把 handler 挂到一个真实的临时端口上,返回 (端口, 关闭函数)。"""
+    from heartsound.monitor import make_handler
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(st))
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    def close():
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=3)
+
+    return srv.server_address[1], close
+
+
+def _req(port, path, method="GET"):
+    """直接用 http.client,不走 urllib。
+
+    urllib 会读 http_proxy 等环境变量,把发往 127.0.0.1 的请求也交给代理,
+    在有代理的环境里全部变成 502。
+    """
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        c.request(method, path, body=b"" if method == "POST" else None)
+        r = c.getresponse()
+        return r.status, r.read()
+    finally:
+        c.close()
+
+
+def test_capture_switch_is_post_only():
+    """开麦克风不能是 GET。
+
+    GET 被当成幂等、可安全重放的操作:浏览器预取、预加载、扫描器,甚至
+    一条聊天里贴出的链接被自动展开,都可能**在没人按按钮的情况下打开
+    麦克风**。所以开关只接受 POST。
+    """
+    from heartsound.monitor import State
+    st = State()
+    port, close = _serve_state(st)
+    try:
+        code, _ = _req(port, "/api/capture?on=1")          # GET
+        assert code == 404, f"GET 竟然被受理了(HTTP {code})"
+        assert st.capture is False, "GET 不该改变采集状态"
+
+        code, body = _req(port, "/api/capture?on=1", "POST")
+        assert code == 200 and json.loads(body)["capture"] is True
+        assert st.capture is True
+
+        code, body = _req(port, "/api/capture?on=0", "POST")
+        assert code == 200 and json.loads(body)["capture"] is False
+        assert st.capture is False
+    finally:
+        close()
+
+
+def test_capture_switch_parses_its_argument_strictly():
+    """含糊的输入一律拒绝,绝不猜成"开"。
+
+    第一版写的是 q.get("on", ["1"]) —— 参数缺失、或 `?on=` 空值,都会落到
+    默认的 "1",**结果是把麦克风打开**。开麦克风不该有这种默认。
+    """
+    from heartsound.monitor import State
+    st = State()
+    port, close = _serve_state(st)
+    try:
+        for v in ("0", "false", "no", "OFF"):
+            st.set_capture(True)
+            assert _req(port, f"/api/capture?on={v}", "POST")[0] == 200
+            assert st.capture is False, f"on={v!r} 应当理解为关"
+        for v in ("1", "true", "yes", "ON"):
+            st.set_capture(False)
+            assert _req(port, f"/api/capture?on={v}", "POST")[0] == 200
+            assert st.capture is True, f"on={v!r} 应当理解为开"
+
+        for path in ("/api/capture", "/api/capture?on=", "/api/capture?on=maybe",
+                     "/api/capture?x=1"):
+            st.set_capture(False)
+            code, body = _req(port, path, "POST")
+            assert code == 400, f"{path} 应当被拒绝,实得 {code}"
+            assert json.loads(body)["ok"] is False
+            assert st.capture is False, f"{path} 竟然打开了麦克风"
+    finally:
+        close()
+
+
+def test_state_endpoint_reports_the_switch():
+    from heartsound.monitor import State
+    st = State()
+    port, close = _serve_state(st)
+    try:
+        d = json.loads(_req(port, "/api/state")[1])
+        assert d["capture"] is False and d["status"] == "idle"
+        _req(port, "/api/capture?on=1", "POST")
+        d = json.loads(_req(port, "/api/state")[1])
+        assert d["capture"] is True
+    finally:
+        close()
+
+
+def test_unknown_post_paths_are_rejected():
+    from heartsound.monitor import State
+    port, close = _serve_state(State())
+    try:
+        assert _req(port, "/api/site?code=AV", "POST")[0] == 404
+        assert _req(port, "/", "POST")[0] == 404
+    finally:
+        close()
+
+
+def test_ui_has_start_and_stop_buttons_wired_to_setcapture():
+    from heartsound import monitor
+    src = (Path(monitor.__file__).parent / "ui.html").read_text(encoding="utf-8")
+    assert 'id="btnGo"' in src and 'id="btnStop"' in src
+    assert 'onclick="setCapture(true)"' in src
+    assert 'onclick="setCapture(false)"' in src
+    # 停止键初始必须是禁用的:还没开始就摆一个可点的"停止"是骗人的
+    go = src[src.index('id="btnGo"'):src.index('id="btnStop"')]
+    stop = src[src.index('id="btnStop"'):]
+    assert "disabled" not in go, "开始键初始不该禁用"
+    assert "disabled" in stop[:stop.index("</button>")], "停止键初始应禁用"
+    assert 'method: "POST"' in src, "前端必须用 POST 调开关"
