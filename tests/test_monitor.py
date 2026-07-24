@@ -7,12 +7,15 @@
 """
 
 import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import numpy as np
-import re
-from pathlib import Path
 import pytest
-
 from heartsound import HeartSoundAnalyzer
 from heartsound.monitor import _build_payload, _downsample
 from heartsound.synth import synthesize
@@ -407,3 +410,57 @@ def test_demo_mode_makes_no_network_requests():
         for a, s in sites:
             assert is_guarded(s), (
                 f"{fn}() 内有 fetch,但第 {line(a)} 行(js 内)的调用点未被守卫")
+
+
+def test_ui_javascript_parses():
+    """ui.html 的脚本必须能被真正的 JS 解析器解析通过。
+
+    起因是真出过一次:属性说明里写了 `'...Gray's Anatomy...'`——单引号串里
+    的撇号提前闭合了字符串。整个 <script> 块解析失败,**页面全白**。
+
+    这类错误 Python 一侧毫无感知:文件读得出、CSS 结构合法、160 项测试全过,
+    但打开就是空白。所以必须交给真解析器,不能用正则糊弄。
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("未安装 node,无法做 JS 语法检查")
+
+    from heartsound import monitor
+    src = (Path(monitor.__file__).parent / "ui.html").read_text(encoding="utf-8")
+    blocks = re.findall(r"<script>(.*?)</script>", src, re.S)
+    assert blocks, "ui.html 里没找到 <script> 块,测试本身失效了"
+
+    for i, code in enumerate(blocks):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                         delete=False) as fh:
+            fh.write(code)
+            tmp = fh.name
+        try:
+            r = subprocess.run([node, "--check", tmp],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, (
+                f"ui.html 第 {i + 1} 个 <script> 块语法错误:\n{r.stderr.strip()}")
+        finally:
+            os.unlink(tmp)
+
+
+def test_inline_event_handlers_dont_break_out_of_their_attribute():
+    """内联 on* 属性里的引号必须与属性定界符区分开。
+
+    onclick="pickSite('AV')" 是对的;若属性值里再出现同种引号,属性会提前
+    结束,后面的代码被当成新属性名——浏览器同样不报错,只是行为诡异。
+    """
+    from heartsound import monitor
+    src = (Path(monitor.__file__).parent / "ui.html").read_text(encoding="utf-8")
+
+    found = 0
+    for m in re.finditer(r'\son(\w+)="([^"]*)"', src):
+        found += 1
+        # 光看值里有没有引号是查不出来的:属性一旦提前闭合,正则就跟着切在
+        # 错的地方,值本身反而"干净"。真正的判据是**闭合引号后面是什么**——
+        # 合法的属性边界只有空白、`>` 或 `/>`。
+        nxt = src[m.end():m.end() + 1]
+        assert nxt == "" or nxt.isspace() or nxt in ">/", (
+            f"on{m.group(1)} 的属性被提前闭合(其后是 {nxt!r}):"
+            f" {src[m.start():m.end() + 20].strip()[:80]}")
+    assert found, "没找到内联 on* 属性,测试本身失效了"
