@@ -245,3 +245,35 @@ def test_level_reported_in_sqi():
     x, fs = synthesize(bpm=72, secs=8, seed=1)
     lv = an.analyze(x, fs)["sqi"]["level_dbfs"]
     assert -3 < lv < 12, f"合成信号峰值约 0 dBFS 量级,实得 {lv}"
+
+
+def test_spectral_profile_no_warning_on_short_segments():
+    """回归:安静段短于 64 样本时 nanmedian 刷出 "All-NaN slice" 警告。
+
+    心率很高时(护带 ±40ms 一扣,安静段可能只剩几十个样本),
+    `_spectral_descriptors` 对每段都返回全 NaN,整列都是 NaN。
+    外面那层 np.errstate 拦不住——它管的是浮点异常(除零、溢出),
+    而这是 warnings 模块的 RuntimeWarning。真实录音上一次刷了 48 条。
+    """
+    import warnings
+    an = HeartSoundAnalyzer()
+    x = np.random.default_rng(0).standard_normal(int(4 * an.fs)) * 0.1
+    cyc = [(i * 400, i * 400 + 220, i * 400 + 400) for i in range(10)]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        r = an.spectral_profile(x, cyc)
+    rw = [i for i in w if issubclass(i.category, RuntimeWarning)]
+    assert not rw, f"仍有 {len(rw)} 条 RuntimeWarning:{str(rw[0].message)[:60]}"
+    assert all(v is None for v in r.values()), "无有效段时应全部返回 None"
+
+
+def test_spectral_profile_still_works_with_mixed_segments():
+    """部分段有效、部分过短时,有效的那些仍要算出来。"""
+    an = HeartSoundAnalyzer()
+    x, fs = synthesize(bpm=72, secs=8, murmur=0.5, seed=2)
+    xr = an.resample(x, fs)
+    r = an.analyze(x, fs)
+    s1, s2 = an.segment_hsmm(r["env_seg"], r["bpm"])
+    prof = an.spectral_profile(xr, an._cycles(s1, s2))
+    assert prof["sys_med_hi_lo"] is not None
+    assert prof["sys_p90_hi_lo"] is not None

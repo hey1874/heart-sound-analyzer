@@ -185,9 +185,20 @@ class FeatureMixin:
                 vals += [None] * (2 * len(stats))
                 continue
             d = np.array([self._spectral_descriptors(s) for s in segs], float)
-            with np.errstate(all="ignore"):
-                agg = np.concatenate([np.nanmedian(d, axis=0),
-                                      np.nanpercentile(d, 90, axis=0)])
+            # 逐列先看有没有有效值再聚合。`_spectral_descriptors` 对短于 64
+            # 样本的段返回全 NaN;心率很高时(护带 ±40ms 一扣,安静段可能只剩
+            # 几十个样本)整列都是 NaN,nanmedian 会刷出 "All-NaN slice" 警告。
+            #
+            # 注意外面那层 np.errstate **拦不住**它——errstate 管的是浮点异常
+            # (除零、溢出),而这是 warnings 模块的 RuntimeWarning。真实录音上
+            # 一次就刷了 48 条。
+            ok = np.isfinite(d).any(axis=0)
+            agg = np.full(2 * d.shape[1], np.nan)
+            if ok.any():
+                sub = d[:, ok]
+                agg[np.flatnonzero(ok)] = np.nanmedian(sub, axis=0)
+                agg[d.shape[1] + np.flatnonzero(ok)] = np.nanpercentile(
+                    sub, 90, axis=0)
             vals += [None if not np.isfinite(v) else float(v) for v in agg]
         return dict(zip(keys, vals))
 
