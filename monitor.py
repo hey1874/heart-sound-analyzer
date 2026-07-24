@@ -3,6 +3,8 @@ monitor.py — 浏览器里的实时心音监视界面(上位机)。
 
     python monitor.py --demo           # 合成数据驱动,不需要麦克风
     python monitor.py                  # 默认输入设备,自动开浏览器
+                                       # 麦克风等你在页面上按「开始采集」才打开
+    python monitor.py --auto-start     # 启动即采集(旧行为)
     python monitor.py --device 2 --port 8800
     python monitor.py --no-browser
 
@@ -29,6 +31,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     p.add_argument("--demo", action="store_true",
                    help="用合成心音驱动界面,不需要麦克风(接线前先验界面)")
+    p.add_argument("--auto-start", action="store_true",
+                   help="启动即开始采集;默认要在页面上按「开始采集」才打开麦克风")
     a = p.parse_args(argv)
 
     dev = a.device
@@ -36,7 +40,7 @@ def main(argv: list[str]) -> int:
         dev = int(dev)
     return serve(device=dev, port=a.port, window_s=a.window, hop_s=a.hop,
                  conf_gate=a.conf_gate, open_browser=not a.no_browser,
-                 demo=a.demo)
+                 demo=a.demo, auto_start=a.auto_start)
 
 
 if __name__ == "__main__":

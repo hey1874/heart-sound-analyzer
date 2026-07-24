@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -121,10 +122,15 @@ def _downsample(x: np.ndarray, n_cols: int = 1000) -> dict:
 class State:
     """最近一次分析结果的快照,供 HTTP 线程读取。"""
 
-    def __init__(self) -> None:
+    def __init__(self, capture: bool = False) -> None:
         self.lock = threading.Lock()
-        self.data: dict = {"status": "starting"}
+        self.data: dict = {"status": "idle"}
         self.stop = False
+        # 是否正在采集。默认**关**:启动进程不等于打开麦克风,得有人明确按
+        # 下「开始采集」。停止时采集线程会真的关闭输入流,系统的录音指示灯
+        # 随之熄灭,设备也交还给别的程序——只是"不分析"做不到这一点。
+        self.capture = bool(capture)
+        self.t0: float | None = time.monotonic() if capture else None
         # 当前听诊区。杂音是位置依赖的(多区取最大可把患者级 AUC 从 0.701
         # 提到 0.762),而且 AV/PV/TV/MV 正是 CirCor 的标签——标上位置,
         # 采到的数据才能直接喂给 calibrate.py。
@@ -140,7 +146,27 @@ class State:
             d = dict(self.data)
             d["site"] = self.site
             d["best_sqi"] = dict(self.best)
+            d["capture"] = self.capture
+            d["elapsed_s"] = (round(time.monotonic() - self.t0, 1)
+                              if self.t0 is not None else 0.0)
             return d
+
+    def set_capture(self, on: bool) -> dict:
+        """开/关采集。状态就地翻转,不必等采集线程转到下一圈。
+
+        前端按下按钮后必须立刻看到变化,否则会以为没点上又点一次。
+        """
+        on = bool(on)
+        with self.lock:
+            was, self.capture = self.capture, on
+            if on and not was:
+                self.t0 = time.monotonic()
+                self.data = {"status": "waiting"}
+            elif not on and was:
+                self.t0 = None
+                # 保留最后一帧画面,只把状态改掉:停下来正是要回看刚采到的东西
+                self.data = dict(self.data, status="stopped")
+            return {"ok": True, "capture": self.capture}
 
     def set_site(self, code: str) -> bool:
         from .sites import BY_CODE
@@ -227,16 +253,36 @@ def _build_payload(an: HeartSoundAnalyzer, res: dict, fs: int,
 
 def capture_loop(state: State, device, window_s: float, hop_s: float,
                  conf_gate: float) -> None:
+    """采集线程:按 state.capture 开合输入流。
+
+    停止时**关闭** MicCapture 而不是继续读着不analyze——两点差别是实的:
+    录音指示灯会灭,设备也让给别的程序。另外重新开始时环形缓冲是新的,
+    不会把停下来之前的旧音频算进第一窗。
+    """
     an = HeartSoundAnalyzer(conf_thr=conf_gate)
-    try:
-        cap = MicCapture(device=device, window_s=window_s).start()
-    except Exception as e:                              # noqa: BLE001
-        state.set({"status": "error",
-                   "message": f"打不开输入设备:{type(e).__name__}: {e}"})
-        return
-    state.set({"status": "waiting", "device": cap.device_name, "fs": cap.fs})
+    cap = None
     try:
         while not state.stop:
+            if not state.capture:
+                if cap is not None:
+                    cap.stop()
+                    cap = None
+                threading.Event().wait(0.05)
+                continue
+
+            if cap is None:
+                try:
+                    cap = MicCapture(device=device, window_s=window_s).start()
+                except Exception as e:                  # noqa: BLE001
+                    # 先落回停止态,免得每 50ms 重试一次;再写错误信息,
+                    # 顺序反了会被 set_capture 覆盖掉。
+                    state.set_capture(False)
+                    state.set({"status": "error",
+                               "message": f"打不开输入设备:{type(e).__name__}: {e}"})
+                    continue
+                state.set({"status": "waiting", "device": cap.device_name,
+                           "fs": cap.fs})
+
             snap = cap.snapshot(min_new_s=hop_s)
             if snap is None:
                 threading.Event().wait(0.1)
@@ -247,11 +293,14 @@ def capture_loop(state: State, device, window_s: float, hop_s: float,
                 state.set({"status": "error",
                            "message": f"分析出错:{type(e).__name__}: {e}"})
                 continue
+            if not state.capture:      # 分析期间被叫停,别再盖掉"已停止"
+                continue
             state.note_quality((res.get("sqi") or {}).get("sqi"))
             state.set(_build_payload(an, res, cap.fs, cap.device_name,
                                      cap.xruns))
     finally:
-        cap.stop()
+        if cap is not None:
+            cap.stop()
 
 
 DEMO_SCENES = [
@@ -271,25 +320,28 @@ def demo_loop(state: State, hop_s: float, conf_gate: float) -> None:
     接线之前就能排除软件侧的问题。轮播几种典型状态,好让被拒绝的那几种
     (工频、削波、噪声大)也能被看到——它们恰恰是最需要界面说清楚的情况。
     """
-    import time
-
     from .synth import synthesize
 
     an = HeartSoundAnalyzer(conf_thr=conf_gate)
     i = 0
     while not state.stop:
+        if not state.capture:
+            time.sleep(0.05)
+            continue
         name, kw = DEMO_SCENES[i % len(DEMO_SCENES)]
         x, fs = synthesize(**kw)
         if name.startswith("削波"):
             x = np.clip(x / (np.max(np.abs(x)) or 1) * 3.0, -1.0, 1.0)
         payload = _build_payload(an, an.analyze(x, fs), int(fs),
                                  f"演示模式 · {name}", 0)
+        if not state.capture:
+            continue
         state.set(payload)
         i += 1
         # 每种状态停留几拍,便于看清;Ctrl+C 能及时退出
         for _ in range(int(max(1, 4 / max(hop_s, 0.1)))):
-            if state.stop:
-                return
+            if state.stop or not state.capture:
+                break
             time.sleep(hop_s)
 
 
@@ -335,6 +387,41 @@ def make_handler(state: State):
             self.end_headers()
             self.wfile.write(body)
 
+        def do_POST(self):                              # noqa: N802
+            """采集开关只接受 POST。
+
+            用 GET 会有实际风险:浏览器的预取/预加载、以及任何"访问一下这个
+            URL"的行为都可能**在没人按按钮的情况下打开麦克风**。改变状态的
+            操作不该是幂等 GET。
+            """
+            if not self.path.startswith("/api/capture"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            from urllib.parse import parse_qs, urlparse
+            # 严格解析,不给默认值。原先写成 q.get("on", ["1"]) —— 参数缺失
+            # 或写成 `?on=` 都会落到默认的 "1",**结果是把麦克风打开**。
+            # 开麦克风这种操作,含糊的输入应当拒绝,而不是猜一个"开"。
+            q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            raw = (q.get("on") or [""])[0].strip().lower()
+            truthy, falsy = {"1", "true", "yes", "on"}, {"0", "false", "no", "off"}
+            if raw not in truthy | falsy:
+                body = json.dumps({"ok": False,
+                                   "error": f"on 参数无效:{raw!r}"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type",
+                                 "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps(state.set_capture(raw in truthy)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, *a):                      # 静音访问日志
             pass
 
@@ -343,8 +430,10 @@ def make_handler(state: State):
 
 def serve(device=None, port: int = 8765, window_s: float = 6.0,
           hop_s: float = 1.0, conf_gate: float = 0.30,
-          open_browser: bool = True, demo: bool = False) -> int:
-    state = State()
+          open_browser: bool = True, demo: bool = False,
+          auto_start: bool = False) -> int:
+    # 演示模式没有麦克风可保护,直接开跑;真采集默认等人按「开始采集」
+    state = State(capture=auto_start or demo)
     if demo:
         t = threading.Thread(target=demo_loop, daemon=True,
                              args=(state, hop_s, conf_gate))
@@ -361,6 +450,10 @@ def serve(device=None, port: int = 8765, window_s: float = 6.0,
         print("   演示模式:用合成心音驱动,不需要麦克风。轮播 "
               f"{len(DEMO_SCENES)} 种典型状态。")
     else:
+        if state.capture:
+            print("   已自动开始采集(--auto-start)。")
+        else:
+            print("   麦克风尚未打开——在页面上按「开始采集」才会打开。")
         print("   把听诊器贴稳(胸骨左缘第 4 肋间 或 心尖),Ctrl+C 退出。")
     print("   仅监听本机回环地址,未做鉴权,请勿暴露到公网。")
     if open_browser:

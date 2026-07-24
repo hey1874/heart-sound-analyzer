@@ -147,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install -e ".[test]" && python -m pytest tests/ -q   # 162 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 172 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
