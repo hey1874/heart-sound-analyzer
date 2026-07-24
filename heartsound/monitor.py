@@ -1,0 +1,329 @@
+"""
+monitor.py — 浏览器里的实时监视界面(上位机)。
+
+为什么要有
+----------
+终端只有一行数字。贴听诊器的时候你需要**看见**:波形长什么样、包络上 S1/S2
+标在哪、能量落在哪个频段、信号质量为什么不合格。看不见就无从判断是位置不对、
+贴得不稳、还是链路本身有问题。
+
+设计前提:**不能让不可靠的判定看起来权威**
+-------------------------------------------
+给这个项目做界面,最大的风险是漂亮的图表让人相信本不该相信的数字。所以:
+
+  · 信号质量放在最显眼处,不合格时整块判定区**变灰并写明原因**,不显示结论;
+  · 杂音 / S3 / S4 这些**阈值未经你的设备标定**的项,一律带"未标定"角标;
+  · 心率、分段、间期这些真实数据验证过的量才用正常样式显示。
+
+实现取舍
+--------
+用标准库 http.server + 前端轮询,**零新增依赖**——与"核心只要 numpy+scipy"
+的定位一致。分析本来就是每秒一次(hop_s=1.0),轮询完全够用,不需要 WebSocket。
+音频采集在后台线程,HTTP 只读最近一次结果的快照。
+
+⚠️ 仅用于学习/研究,非医疗器械,不能用于诊断。
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import numpy as np
+
+from .analyzer import HeartSoundAnalyzer
+from .capture import MicCapture
+
+PAGE = None            # 延迟加载 ui.html
+
+
+def _page() -> bytes:
+    global PAGE
+    if PAGE is None:
+        import os
+        p = os.path.join(os.path.dirname(__file__), "ui.html")
+        with open(p, "rb") as fh:
+            PAGE = fh.read()
+    return PAGE
+
+
+def _spectrogram(xr: np.ndarray, fs: float, n_frames: int = 220) -> dict:
+    """给界面用的对数梅尔频谱图,量化成 0-255 的整数。
+
+    为什么用频谱图而不是原始波形当主角:心音是**脉冲信号**——实测峰峰值
+    中位数只有最大值的 5.5%,仅 4.9% 的列超过最大值一半。极值填充带画出来
+    必然是"一条近乎平直的线 + 几根孤立尖峰",稀疏破碎。音频编辑器里波形
+    好看是因为音乐/语音能量连续,心音不是。
+
+    而频谱图对这个领域信息量大得多:**杂音就是收缩期里的高频能量带,在
+    频谱图上直接看得见**。这也正是 CNN 吃的表示(见 cnn.logmel)。
+
+    量化到 0-255 是为了控制负载:64×220 的浮点数组约 56KB,量化后 14KB。
+    """
+    from .cnn import logmel
+
+    if xr.size < 512:
+        return {"w": 0, "h": 0, "data": []}
+    m = logmel(xr)                       # (n_mels, frames),已是对数域
+    if m.shape[1] > n_frames:
+        # 分箱必须**覆盖整条时间轴**。早先写成 m[:, :k*n_frames](k 为整除
+        # 商)会把尾部余数直接截掉:8 秒窗只剩 89% 的时间轴、12 秒窗只剩
+        # 59%,却仍被铺满整个画布宽度并标上秒刻度——频谱图与包络图的
+        # S1/S2 因此对不上。改用覆盖全轴的边界索引。
+        edge = np.linspace(0, m.shape[1], n_frames + 1).astype(int)
+        m = np.stack([m[:, edge[i]:max(edge[i] + 1, edge[i + 1])].max(axis=1)
+                      for i in range(n_frames)], axis=1)
+    lo = float(np.percentile(m, 5))      # 5% 分位当底,拉开对比度
+    hi = float(m.max())
+    if hi - lo < 1e-9:
+        return {"w": 0, "h": 0, "data": []}
+    q = np.clip((m - lo) / (hi - lo), 0, 1)
+    return {"w": int(m.shape[1]), "h": int(m.shape[0]),
+            "data": (q * 255).astype(np.uint8).T.ravel().tolist()}
+
+
+def _downsample(x: np.ndarray, n_cols: int = 1000) -> dict:
+    """给绘图用的降采样:每列给出 (最小, 最大, RMS)。
+
+    为什么要三个量而不是两个
+    ------------------------
+    心音是**脉冲信号**:实测峰峰值中位数只有最大值的 5.5%,只有 4.9% 的列
+    超过最大值一半。只画 min/max 包络,画出来就是"一条近乎平直的线 + 几根
+    孤立尖峰",稀疏破碎。
+
+    专业音频软件的画法是**双层**:外层浅色画峰值包络,内层深色画 RMS。
+    RMS 把中间填实,波形有了体量感,而且它表达的是**真实能量**,不是把
+    振幅拉伸的视觉作弊。
+
+    归一化用 99.5 分位而非绝对最大值:最大值被 S1 那一根尖峰独占,拿它做
+    基准会把其余部分全压扁(实测列高中位从 8.9px 掉到 6.5px)。
+
+    为什么不隔点抽样:那会漏掉尖峰,画出来比实际**更干净**——对一个以判断
+    信号质量为要务的界面,这种失真正好把该看见的问题藏起来。
+    """
+    x = np.asarray(x, float).ravel()
+    if x.size < 4:
+        return {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0}
+    n_cols = max(1, min(n_cols, x.size))
+    k = int(np.ceil(x.size / n_cols))
+    pad = (-x.size) % k
+    if pad:                                        # 用末值补齐,不丢尾部
+        x = np.concatenate([x, np.full(pad, x[-1])])
+    seg = x.reshape(-1, k)
+    ref = float(np.percentile(np.abs(x), 99.5)) or float(np.max(np.abs(x))) or 1.0
+    r3 = lambda a: [round(float(v), 4) for v in a]      # noqa: E731
+    return {"n": int(seg.shape[0]), "ref": round(ref, 6),
+            "lo": r3(seg.min(axis=1)), "hi": r3(seg.max(axis=1)),
+            "rms": r3(np.sqrt((seg ** 2).mean(axis=1)))}
+
+
+class State:
+    """最近一次分析结果的快照,供 HTTP 线程读取。"""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.data: dict = {"status": "starting"}
+        self.stop = False
+
+    def set(self, d: dict) -> None:
+        with self.lock:
+            self.data = d
+
+    def get(self) -> dict:
+        with self.lock:
+            return self.data
+
+
+def _build_payload(an: HeartSoundAnalyzer, res: dict, fs: int,
+                   device: str, xruns: int) -> dict:
+    """把 analyze() 的结果压成前端要的样子。
+
+    只挑绘图与展示需要的量,并且**明确区分**「已验证」与「未标定」两类,
+    前端据此决定用什么样式显示。
+    """
+    sqi = res.get("sqi") or {}
+    rh = res.get("rhythm") or {}
+    sti = res.get("sti") or {}
+    mu = res.get("murmur") or {}
+    ex = res.get("extra_sounds") or {}
+    sp = res.get("s2_split") or {}
+
+    env = res.get("env")
+    env_seg = res.get("env_seg")
+    beats = res.get("beats")
+    wave = res.get("filtered")
+    n_env = len(env) if env is not None else 0
+
+    # S1/S2 位置:用与生产路径相同的窄带包络重算,保证画出来的就是实际用的
+    s1 = s2 = []
+    if env_seg is not None and len(env_seg) and res.get("bpm"):
+        a, b = an.segment_hsmm(env_seg, res["bpm"])
+        if len(a) < 3:
+            a, b = an.segment_s1s2(an.detect_beats(env_seg))
+        s1 = [round(float(v) / n_env, 5) for v in a] if n_env else []
+        s2 = [round(float(v) / n_env, 5) for v in b] if n_env else []
+
+    return {
+        "status": "ok",
+        "device": device, "fs": fs, "xruns": xruns,
+        # --- 已验证:可以正常显示 ---
+        "reliable": bool(res.get("reliable")),
+        "reason": res.get("unreliable_reason"),
+        "bpm": res.get("bpm"),
+        "confidence": round(float(res.get("confidence") or 0), 3),
+        "n_beats": res.get("n_beats"),
+        "sqi": {k: (round(float(v), 3) if isinstance(v, (int, float)) else v)
+                for k, v in sqi.items()},
+        "systole_ms": sti.get("systole_ms"),
+        "diastole_ms": sti.get("diastole_ms"),
+        "sys_dia_ratio": sti.get("sys_dia_ratio"),
+        # --- 未标定:前端会打角标 ---
+        "rhythm": rh.get("classification"),
+        "cv_robust": rh.get("cv_robust"),
+        "murmur_flag": mu.get("flag"),
+        "murmur_sys": mu.get("systolic"),
+        "murmur_dia": mu.get("diastolic"),
+        "murmur_asym": mu.get("asymmetry"),
+        "extra_flag": ex.get("flag"),
+        "split_flag": sp.get("flag"),
+        # --- 绘图数据 ---
+        "wave": _downsample(wave, 1000) if wave is not None else
+                {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0},
+        "spec": _spectrogram(res.get("resampled"), an.fs)
+                if res.get("resampled") is not None else {"w": 0, "h": 0, "data": []},
+        "env": _downsample(env, 900) if env is not None else
+               {"n": 0, "lo": [], "hi": [], "rms": [], "ref": 1.0},
+        "beats": ([round(float(v) / n_env, 5) for v in beats]
+                  if beats is not None and n_env else []),
+        "s1": s1, "s2": s2,
+        "window_s": round(n_env / an.fs, 2) if n_env else 0,
+    }
+
+
+def capture_loop(state: State, device, window_s: float, hop_s: float,
+                 conf_gate: float) -> None:
+    an = HeartSoundAnalyzer(conf_thr=conf_gate)
+    try:
+        cap = MicCapture(device=device, window_s=window_s).start()
+    except Exception as e:                              # noqa: BLE001
+        state.set({"status": "error",
+                   "message": f"打不开输入设备:{type(e).__name__}: {e}"})
+        return
+    state.set({"status": "waiting", "device": cap.device_name, "fs": cap.fs})
+    try:
+        while not state.stop:
+            snap = cap.snapshot(min_new_s=hop_s)
+            if snap is None:
+                threading.Event().wait(0.1)
+                continue
+            try:
+                res = an.analyze(snap, cap.fs)
+            except Exception as e:                      # noqa: BLE001
+                state.set({"status": "error",
+                           "message": f"分析出错:{type(e).__name__}: {e}"})
+                continue
+            state.set(_build_payload(an, res, cap.fs, cap.device_name,
+                                     cap.xruns))
+    finally:
+        cap.stop()
+
+
+DEMO_SCENES = [
+    ("正常", dict(bpm=68, secs=8, noise=0.05, seed=11)),
+    ("收缩期杂音", dict(bpm=72, secs=8, murmur=0.5, murmur_shape="diamond",
+                        noise=0.05, seed=2)),
+    ("环境噪声偏大", dict(bpm=74, secs=8, noise=0.28, seed=23)),
+    ("50Hz 工频干扰", dict(bpm=72, secs=8, hum_hz=50.0, hum=3.0, seed=5)),
+    ("削波/过载", dict(bpm=70, secs=8, noise=0.05, seed=31)),
+]
+
+
+def demo_loop(state: State, hop_s: float, conf_gate: float) -> None:
+    """用合成心音驱动界面,不需要麦克风。
+
+    存在的理由不只是"演示":没有硬件时也能确认界面、门控、绘图都正常,
+    接线之前就能排除软件侧的问题。轮播几种典型状态,好让被拒绝的那几种
+    (工频、削波、噪声大)也能被看到——它们恰恰是最需要界面说清楚的情况。
+    """
+    import time
+
+    from .synth import synthesize
+
+    an = HeartSoundAnalyzer(conf_thr=conf_gate)
+    i = 0
+    while not state.stop:
+        name, kw = DEMO_SCENES[i % len(DEMO_SCENES)]
+        x, fs = synthesize(**kw)
+        if name.startswith("削波"):
+            x = np.clip(x / (np.max(np.abs(x)) or 1) * 3.0, -1.0, 1.0)
+        payload = _build_payload(an, an.analyze(x, fs), int(fs),
+                                 f"演示模式 · {name}", 0)
+        state.set(payload)
+        i += 1
+        # 每种状态停留几拍,便于看清;Ctrl+C 能及时退出
+        for _ in range(int(max(1, 4 / max(hop_s, 0.1)))):
+            if state.stop:
+                return
+            time.sleep(hop_s)
+
+
+def make_handler(state: State):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):                               # noqa: N802
+            if self.path.startswith("/api/state"):
+                body = json.dumps(state.get(), ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+            elif self.path in ("/", "/index.html"):
+                body = _page()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):                      # 静音访问日志
+            pass
+
+    return Handler
+
+
+def serve(device=None, port: int = 8765, window_s: float = 6.0,
+          hop_s: float = 1.0, conf_gate: float = 0.30,
+          open_browser: bool = True, demo: bool = False) -> int:
+    state = State()
+    if demo:
+        t = threading.Thread(target=demo_loop, daemon=True,
+                             args=(state, hop_s, conf_gate))
+    else:
+        t = threading.Thread(target=capture_loop, daemon=True,
+                             args=(state, device, window_s, hop_s, conf_gate))
+    t.start()
+
+    # 只绑 127.0.0.1:这是本机监视工具,没有任何鉴权,不应暴露到网络上
+    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
+    url = f"http://127.0.0.1:{port}/"
+    print(f"🎙  监视界面: {url}")
+    if demo:
+        print("   演示模式:用合成心音驱动,不需要麦克风。轮播 "
+              f"{len(DEMO_SCENES)} 种典型状态。")
+    else:
+        print("   把听诊器贴稳(胸骨左缘第 4 肋间 或 心尖),Ctrl+C 退出。")
+    print("   仅监听本机回环地址,未做鉴权,请勿暴露到公网。")
+    if open_browser:
+        import webbrowser
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止。")
+    finally:
+        state.stop = True
+        srv.server_close()
+    return 0

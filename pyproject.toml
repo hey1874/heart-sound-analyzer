@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heartsound"
+version = "0.2.0"
+description = "心音听诊分析:心率、S1/S2 分段、信号质量门控与杂音提示(非医疗器械)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["phonocardiogram", "heart-sound", "auscultation", "PCG", "DSP"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Intended Audience :: Science/Research",
+]
+# 核心只依赖 numpy+scipy:分段、心率、SQI 这些经过真实数据验证的能力
+# 不需要 sklearn/sounddevice,保持轻量以便被别的项目直接引用。
+dependencies = ["numpy>=1.23", "scipy>=1.9"]
+
+[project.optional-dependencies]
+audio = ["sounddevice>=0.4", "soundfile>=0.12"]   # 实时采集 / 读音频文件
+ml = ["scikit-learn>=1.2", "joblib>=1.2"]         # 分类基线与标定
+cnn = ["torch>=2.0"]                              # 可选的频谱图 CNN
+test = ["pytest>=7.0"]
+all = ["sounddevice>=0.4", "soundfile>=0.12", "scikit-learn>=1.2",
+       "joblib>=1.2", "pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/hey1874/heart-sound-analyzer"
+
+[tool.setuptools]
+packages = ["heartsound"]
+
+[tool.setuptools.package-data]
+# 监视界面是单页 HTML,必须随包一起装
+heartsound = ["ui.html"]
+py-modules = ["heartbeat", "predict", "classifier", "selftest", "checkmic",
+              "calibrate", "external_eval", "train_cnn", "monitor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
