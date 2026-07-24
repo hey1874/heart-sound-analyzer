@@ -13,6 +13,7 @@ env/
 *.wav
 *.flac
 *.npy
+*.npz
 data/
 recordings/
 
@@ -21,6 +22,14 @@ recordings/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 训练/评估产物(不入库)
+cnn_scores.npz
+cnn_feats.npz
+thresholds.json
+*.pt
+model_physionet.joblib
+!tests/fixture_thresholds.json
 
 # 图表输出
 *.png
