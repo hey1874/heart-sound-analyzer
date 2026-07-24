@@ -92,6 +92,18 @@ class MicCapture:
             self._stream.close()
             self._stream = None
 
+    @property
+    def fill_ratio(self) -> float:
+        """环形缓冲已填充的比例(0~1)。
+
+        界面按下「开始采集」后要等满一个窗(默认 6 秒)才有第一帧结果。
+        不把进度显示出来,这几秒看着就像没点上。
+        """
+        if self._ring is None or len(self._ring) == 0:
+            return 0.0
+        with self._lock:
+            return min(1.0, self._filled / len(self._ring))
+
     def snapshot(self, min_new_s: float = 0.0) -> np.ndarray | None:
         """取按时间顺序排好的最近一窗。
 
