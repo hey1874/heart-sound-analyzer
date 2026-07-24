@@ -43,24 +43,14 @@ from __future__ import annotations
 
 import csv
 import os
-import sys
 
 import numpy as np
 
-from classifier import HeartSoundClassifier, feature_vector
-from heartbeat import HeartSoundAnalyzer
+from heartsound import HeartSoundAnalyzer
+from heartsound.classifier import HeartSoundClassifier, feature_vector
+from heartsound.evalutil import auc
 
 
-def auc(score: np.ndarray, label: np.ndarray) -> float:
-    m = np.isfinite(score)
-    score, label = score[m], label[m]
-    if len(set(label.tolist())) < 2:
-        return float("nan")
-    ys = label[np.argsort(-score)]
-    tpr = np.cumsum(ys) / max(1, ys.sum())
-    fpr = np.cumsum(1 - ys) / max(1, (1 - ys).sum())
-    trapz = getattr(np, "trapezoid", np.trapz)
-    return float(trapz(tpr, fpr))
 
 
 def load_2016(directory: str, cnn_path: str | None = None,
@@ -126,25 +116,25 @@ def load_2016(directory: str, cnn_path: str | None = None,
             np.array(cnn_s, float) if cnn_s else None)
 
 
-def main(argv):
-    if not argv or argv[0].startswith("-"):
-        print(__doc__)
-        return 1
-    directory = argv[0]
-    cnn_path = argv[argv.index("--cnn") + 1] if "--cnn" in argv else None
-    circor = argv[argv.index("--circor") + 1] if "--circor" in argv else None
-    cache = argv[argv.index("--cache") + 1] if "--cache" in argv else "ext2016.npz"
-    per_sub = (int(argv[argv.index("--per-subset") + 1])
-               if "--per-subset" in argv else 250)
+def main(argv: list[str]) -> int:
+    from heartsound.cliutil import Parser
+    p = Parser("在 PhysioNet/CinC 2016 上做外部验证")
+    p.add_argument("directory", help="2016 数据目录(含 REFERENCE-{a..f}.csv 与 data/)")
+    p.add_argument("--cnn", help="CirCor 上训好的 CNN 模型(train_cnn.py --save 产出)")
+    p.add_argument("--circor", help="CirCor 目录,用于零样本迁移对照")
+    p.add_argument("--cache", default="ext2016.npz", help="特征缓存文件")
+    p.add_argument("--per-subset", type=int, default=250,
+                   help="每个来源子库最多取多少条(0=全量)")
+    a = p.parse_args(argv)
 
-    if os.path.exists(cache):
-        d = np.load(cache, allow_pickle=True)
+    if os.path.exists(a.cache):
+        d = np.load(a.cache, allow_pickle=True)
         X, y, sub, names, rel = d["X"], d["y"], d["sub"], d["names"], d["rel"]
         cnn_s = d["cnn"] if "cnn" in d and d["cnn"].size else None
-        print(f"从缓存读取 {cache}")
+        print(f"从缓存读取 {a.cache}")
     else:
-        X, y, sub, names, rel, cnn_s = load_2016(directory, cnn_path, per_sub)
-        np.savez_compressed(cache, X=X, y=y, sub=sub, names=names, rel=rel,
+        X, y, sub, names, rel, cnn_s = load_2016(a.directory, a.cnn, a.per_subset)
+        np.savez_compressed(a.cache, X=X, y=y, sub=sub, names=names, rel=rel,
                             cnn=cnn_s if cnn_s is not None else np.array([]))
     print(f"\n可用 {len(y)} 条 / 异常 {int(y.sum())} / 正常 {int((1 - y).sum())}"
           f" / 通过门控 {int(rel.sum())} ({rel.mean():.0%})")
@@ -160,17 +150,19 @@ def main(argv):
     if cnn_s is not None:
         print(f"   CNN(CirCor 训练)          AUC {auc(cnn_s, y):.3f}")
         print(f"     仅通过门控的录音          AUC {auc(cnn_s[rel], y[rel]):.3f}")
-    if circor:
+    if a.circor:
         import pickle
-        cc = os.path.join(circor, "..", "fair_feats.pkl")
+        cc = os.path.join(a.circor, "..", "fair_feats.pkl")
         if os.path.exists(cc):
             Xc, yc, gc, _, _ = pickle.load(open(cc, "rb"))
             clf = HeartSoundClassifier().fit(np.array(Xc, float),
                                              np.array(yc, int),
                                              groups=np.array(gc))
-            p = clf.predict_proba(X)
-            print(f"   树模型(CirCor 训练)       AUC {auc(p, y):.3f}")
-            print(f"     仅通过门控的录音          AUC {auc(p[rel], y[rel]):.3f}")
+            pr = clf.predict_proba(X)
+            print(f"   树模型(CirCor 训练)       AUC {auc(pr, y):.3f}")
+            print(f"     仅通过门控的录音          AUC {auc(pr[rel], y[rel]):.3f}")
+        else:
+            print(f"   (未找到 {cc},跳过树模型迁移对照)")
 
     print("\n" + "=" * 66)
     print("B. 2016 内部:留一子库交叉验证(直接测跨设备/跨来源泛化)")
@@ -202,9 +194,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main(sys.argv[1:]))
+    from heartsound.cliutil import run
+    run(main)

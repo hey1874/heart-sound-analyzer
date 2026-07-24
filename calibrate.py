@@ -33,39 +33,17 @@ calibrate.py — 用带标注的真实心音数据标定阈值,并验证分段�
 
 from __future__ import annotations
 
-import csv
 import glob
 import json
 import os
-import sys
 
 import numpy as np
 
-from classifier import (FEATURE_NAMES, HeartSoundClassifier, feature_vector,
-                        threshold_baseline)
-from heartbeat import HeartSoundAnalyzer
-
-WAVE_S1 = 1        # .tsv 中的 wave 编号
-
-
-def load_segments(path: str) -> list[tuple[float, float, int]]:
-    out = []
-    with open(path) as fh:
-        for line in fh:
-            a = line.split()
-            if len(a) == 3:
-                out.append((float(a[0]), float(a[1]), int(a[2])))
-    return out
-
-
-def reference_bpm(segs: list[tuple[float, float, int]]) -> float | None:
-    """由官方 S1 标注的中位 RR 算参考心率。"""
-    g = np.array([s for s, _, w in segs if w == WAVE_S1])
-    if len(g) < 5:
-        return None
-    rr = np.diff(g)
-    rr = rr[(rr > 0.3) & (rr < 1.6)]       # 去掉跨未标注区造成的跳变
-    return 60.0 / float(np.median(rr)) if len(rr) >= 4 else None
+from heartsound import HeartSoundAnalyzer
+from heartsound.classifier import (FEATURE_NAMES, HeartSoundClassifier,
+                                   feature_vector, threshold_baseline)
+from heartsound.evalutil import (WAVE_S1, auc, is_labeled, load_circor_meta,
+                                 load_segments, murmur_label, reference_bpm)
 
 
 def _eval_segmentation(an, sig, fs, bpm, segs, tol_ms: float = 100.0):
@@ -102,11 +80,7 @@ def collect(directory: str, limit: int | None = None) -> list[dict]:
     """遍历数据集,对每条录音跑分析并带上标签与真值。"""
     import soundfile as sf
 
-    meta_path = os.path.join(directory, "training_data.csv")
-    if not os.path.exists(meta_path):
-        raise SystemExit(f"找不到 {meta_path};请确认是 CirCor 数据集目录")
-    meta = {r["Patient ID"]: r for r in
-            csv.DictReader(open(meta_path, encoding="utf-8"))}
+    meta = load_circor_meta(directory)
 
     wavs = sorted(glob.glob(os.path.join(directory, "training_data", "*.wav")))
     if not wavs:                                   # 也接受平铺目录
@@ -124,7 +98,7 @@ def collect(directory: str, limit: int | None = None) -> list[dict]:
             continue
         pid, loc = parts[0], parts[1]
         m = meta.get(pid)
-        if m is None or m["Murmur"] == "Unknown":   # Unknown 不参与标定
+        if m is None or not is_labeled(m):          # Unknown 不参与标定
             continue
         try:
             sig, fs = sf.read(w)
@@ -148,9 +122,8 @@ def collect(directory: str, limit: int | None = None) -> list[dict]:
         out.append({
             "seg_eval": seg_eval,
             "stem": stem, "patient": pid, "location": loc,
-            # 标签:患者有杂音**且**该听诊区在杂音位置列表中,才算阳性
-            "y": int(m["Murmur"] == "Present"
-                     and loc in (m["Murmur locations"] or "").split("+")),
+            # 标签定义唯一来源见 heartsound.evalutil.murmur_label
+            "y": murmur_label(m, loc),
             "grade": m["Systolic murmur grading"],
             "res": res, "feat": feature_vector(res),
             "ref_bpm": ref, "has_segs": bool(segs),
@@ -230,16 +203,6 @@ def report_segmentation(recs: list[dict], tol_ms: float = 100.0) -> dict:
                              "n_recordings": n_rec, "n_s1": tp + fn}}
 
 
-def _roc(pos: np.ndarray, neg: np.ndarray) -> float:
-    v = np.concatenate([pos, neg])
-    y = np.concatenate([np.ones(len(pos)), np.zeros(len(neg))])
-    ys = y[np.argsort(-v)]
-    tpr = np.cumsum(ys) / max(1, ys.sum())
-    fpr = np.cumsum(1 - ys) / max(1, (1 - ys).sum())
-    trapz = getattr(np, "trapezoid", np.trapz)
-    return float(trapz(tpr, fpr))
-
-
 def report_murmur(recs: list[dict], default_thr: float = 0.15) -> dict:
     """杂音阈值标定:ROC 与若干工作点。"""
     print("\n" + "=" * 68)
@@ -257,10 +220,11 @@ def report_murmur(recs: list[dict], default_thr: float = 0.15) -> dict:
           f"(IQR {np.percentile(pos, 25):.3f}-{np.percentile(pos, 75):.3f})")
     print(f"  无杂音 murmur_sys 中位 {np.median(neg):.3f} "
           f"(IQR {np.percentile(neg, 25):.3f}-{np.percentile(neg, 75):.3f})")
-    auc = _roc(pos, neg)
-    print(f"  AUC = {auc:.3f}")
+    area = auc(np.concatenate([pos, neg]),
+               np.concatenate([np.ones(len(pos)), np.zeros(len(neg))]))
+    print(f"  AUC = {area:.3f}")
 
-    out = {"auc": auc, "n_pos": len(pos), "n_neg": len(neg), "points": {}}
+    out = {"auc": area, "n_pos": len(pos), "n_neg": len(neg), "points": {}}
     cands = np.unique(np.concatenate([pos, neg]))
 
     def at(t):
@@ -338,25 +302,21 @@ def report_ml(recs: list[dict]) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0].startswith("-"):
-        print(__doc__)
-        return 1
-    directory = argv[0]
-    out_path = "thresholds.json"
-    limit = None
-    if "--out" in argv:
-        out_path = argv[argv.index("--out") + 1]
-    if "--limit" in argv:
-        limit = int(argv[argv.index("--limit") + 1])
+    from heartsound.cliutil import Parser
+    p = Parser("用带标注的真实心音数据标定阈值,并验证分段与杂音检测")
+    p.add_argument("directory", help="CirCor DigiScope 格式的数据集目录")
+    p.add_argument("--out", default="thresholds.json", help="阈值输出文件")
+    p.add_argument("--limit", type=int, help="只处理前 N 条录音(调试用)")
+    a = p.parse_args(argv)
 
-    recs = collect(directory, limit)
+    recs = collect(a.directory, a.limit)
     if not recs:
         print("没有可用录音")
         return 1
     print(f"\n可用 {len(recs)} 条录音 / {len(set(r['patient'] for r in recs))} 名患者"
           f"(阳性 {sum(r['y'] for r in recs)})")
 
-    result = {"dataset": os.path.abspath(directory), "n_recordings": len(recs),
+    result = {"dataset": os.path.abspath(a.directory), "n_recordings": len(recs),
               "n_patients": len(set(r["patient"] for r in recs)),
               "feature_names": list(FEATURE_NAMES)}
     result.update(report_gate(recs))
@@ -364,17 +324,13 @@ def main(argv: list[str]) -> int:
     result.update(report_murmur(recs))
     result.update(report_ml(recs))
 
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with open(a.out, "w", encoding="utf-8") as fh:
         json.dump(result, fh, ensure_ascii=False, indent=2)
-    print(f"\n已写出 {out_path}")
+    print(f"\n已写出 {a.out}")
     print("用 HeartSoundAnalyzer.from_json() 加载标定后的阈值。")
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main(sys.argv[1:]))
+    from heartsound.cliutil import run
+    run(main)

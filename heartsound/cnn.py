@@ -84,7 +84,7 @@ def windows(x: np.ndarray, fs: float, analyzer=None) -> list[np.ndarray]:
     切窗前先做与传统管线**相同**的重采样和带通,保证两条路线吃到的是同一个
     前处理结果——否则性能差异会混入前处理差异。
     """
-    from heartbeat import HeartSoundAnalyzer
+    from .analyzer import HeartSoundAnalyzer
     an = analyzer or HeartSoundAnalyzer()
     xr = an.resample(x, fs)
     if xr.size < 2:

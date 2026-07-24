@@ -20,12 +20,13 @@ predict.py — 加载训练好的模型,对录音做"正常 vs 异常"预测。
 from __future__ import annotations
 
 import os
-import sys
 
 import numpy as np
 
-from classifier import FEATURE_NAMES, HeartSoundClassifier, feature_vector
-from heartbeat import HeartSoundAnalyzer
+from heartsound import HeartSoundAnalyzer
+from heartsound.classifier import (FEATURE_NAMES, HeartSoundClassifier,
+                                   feature_vector)
+from heartsound.cliutil import Parser, run
 
 
 def classify(x: np.ndarray, fs: float, model_path: str) -> dict:
@@ -111,49 +112,42 @@ def _print_report(out: dict, model_path: str, force: bool = False) -> int:
 
 
 def main(argv: list[str]) -> int:
-    args = list(argv)
-    model = "model_demo.joblib"
-    if "--model" in args:
-        i = args.index("--model")
-        if i + 1 >= len(args):          # 原实现在此直接 IndexError 抛栈回溯
-            print("--model 后面需要跟模型文件路径")
-            return 1
-        model = args[i + 1]
-        args = args[:i] + args[i + 2:]
-    force = "--force" in args
-    args = [a for a in args if a != "--force"]
+    p = Parser("对录音做「正常 vs 异常」预测(带信号质量门控)")
+    p.add_argument("audio", nargs="?", help="要分析的音频文件(.wav 等)")
+    p.add_argument("--model", default="model_demo.joblib",
+                   help="模型文件。⚠️ .joblib 走 pickle 反序列化,加载即执行其中"
+                        "的代码,只加载可信来源")
+    p.add_argument("--selftest", action="store_true", help="用合成杂音信号自检")
+    p.add_argument("--force", action="store_true",
+                   help="信号质量不合格时仍给出判定(结果不可信)")
+    a = p.parse_args(argv)
 
-    if not os.path.exists(model):
-        print(f"找不到模型 {model};先运行 python classifier.py --train-demo")
+    if not os.path.exists(a.model):
+        print(f"找不到模型 {a.model};先运行 python classifier.py --train-demo")
         return 1
 
-    if "--selftest" in args:
-        from synth import synthesize
-        x, fs = synthesize(bpm=72, secs=12, murmur=0.5, murmur_shape="diamond",
-                           seed=42)
-        return _print_report(classify(x, fs, model), model, force)
-    if args:
-        try:
-            import soundfile as sf
-        except ImportError:
-            print("读取音频需要 soundfile:pip install soundfile")
-            return 1
-        try:
-            sig, fs = sf.read(args[0])
-        except Exception as e:                      # noqa: BLE001
-            print(f"无法读取 {args[0]}: {type(e).__name__}: {e}")
-            return 1
-        if sig.ndim > 1:
-            sig = sig[:, 0]
-        return _print_report(classify(sig, fs, model), model, force)
-    print(__doc__)
-    return 0
+    if a.selftest:
+        from heartsound.synth import synthesize
+        x, fs = synthesize(bpm=72, secs=12, murmur=0.5,
+                           murmur_shape="diamond", seed=42)
+        return _print_report(classify(x, fs, a.model), a.model, a.force)
+    if not a.audio:
+        p.print_help()
+        return 0
+    try:
+        import soundfile as sf
+    except ImportError:
+        print("读取音频需要 soundfile:pip install soundfile")
+        return 1
+    try:
+        sig, fs = sf.read(a.audio)
+    except Exception as e:                          # noqa: BLE001
+        print(f"无法读取 {a.audio}: {type(e).__name__}: {e}")
+        return 1
+    if sig.ndim > 1:
+        sig = sig[:, 0]
+    return _print_report(classify(sig, fs, a.model), a.model, a.force)
 
 
 if __name__ == "__main__":
-    try:   # Windows 控制台默认 GBK;stderr 也要一起切,否则报错信息乱码
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main(sys.argv[1:]))
+    run(main)

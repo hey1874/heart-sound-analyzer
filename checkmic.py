@@ -27,7 +27,6 @@ checkmic.py — 采集链路体检:在录心音之前,先确认这条链路没�
 
 from __future__ import annotations
 
-import sys
 
 import numpy as np
 from scipy import signal
@@ -89,7 +88,7 @@ def diagnose(x: np.ndarray, fs: float) -> list[tuple[str, str, str]]:
         pass
 
     # --- 工频 ---
-    from heartbeat import HeartSoundAnalyzer
+    from heartsound import HeartSoundAnalyzer
     an = HeartSoundAnalyzer()
     xr = an.resample(x, fs)
     fq, pq = signal.welch(xr, fs=an.fs, nperseg=min(len(xr), 2048))
@@ -134,28 +133,29 @@ def diagnose(x: np.ndarray, fs: float) -> list[tuple[str, str, str]]:
 
 
 def main(argv: list[str]) -> int:
+    from heartsound.cliutil import Parser
+    p = Parser("采集链路体检:录一段环境声,检查低频高通/工频/削波/电平/AGC")
+    p.add_argument("--list", action="store_true", help="列出所有输入设备后退出")
+    p.add_argument("--device", help="输入设备编号或名称")
+    p.add_argument("--seconds", type=float, default=5.0, help="录音时长(秒)")
+    a = p.parse_args(argv)
+
     try:
         import sounddevice as sd
     except ImportError:
         print("需要 sounddevice:pip install sounddevice")
         return 1
-
-    if "--list" in argv:
+    if a.list:
         print(sd.query_devices())
         return 0
 
-    device = None
-    if "--device" in argv:
-        device = argv[argv.index("--device") + 1]
-        device = int(device) if device.isdigit() else device
-    secs = float(argv[argv.index("--seconds") + 1]) if "--seconds" in argv else 5.0
-
+    device = int(a.device) if (a.device or "").isdigit() else a.device
     info = sd.query_devices(device, "input")
     fs = int(info["default_samplerate"])
-    print(f"设备: {info['name']}   采样率 {fs} Hz   录音 {secs:.0f} 秒")
+    print(f"设备: {info['name']}   采样率 {fs} Hz   录音 {a.seconds:.0f} 秒")
     print("保持安静,**不要贴听诊器**——本检查看的是链路本身,不是心音。\n")
-    rec = sd.rec(int(secs * fs), samplerate=fs, channels=1, dtype="float32",
-                 device=device)
+    rec = sd.rec(int(a.seconds * fs), samplerate=fs, channels=1,
+                 dtype="float32", device=device)
     sd.wait()
     x = rec[:, 0].astype(np.float64)
 
@@ -173,15 +173,15 @@ def main(argv: list[str]) -> int:
         print(f"⚠️  {warn} 项需注意,但可以先试录。")
     else:
         print("✅ 链路检查通过,可以开始录心音了:python heartbeat.py")
-    print("\n注:本检查基于环境底噪的频谱形状,只能发现明显的高通/工频/AGC/削波。"
-          "\n精确标定频响需要已知声源(扫频或校准声级计)。")
+    print("\n无论本检查结果如何,以下两项请**手动**确认(工具查不可靠):")
+    print("  · macOS:系统设置 → 声音 → 输入,关闭「环境降噪」")
+    print("  · Windows:声音设置 → 输入设备属性 → 高级,关闭「麦克风增强」/AGC")
+    print("  这两者是为人声设计的,会在 100Hz 以上做高通,正好砍掉 S1/S2 主能量。")
+    print("\n注:本检查基于环境底噪的频谱形状,只能发现明显的高通/工频/削波;"
+          "\nAGC 一项判据不可靠(见输出说明)。精确标定频响需已知声源(扫频/声级计)。")
     return 2 if bad else 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main(sys.argv[1:]))
+    from heartsound.cliutil import run
+    run(main)

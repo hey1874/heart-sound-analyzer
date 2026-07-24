@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 from scipy import signal as sg
 
-from classifier import FEATURE_NAMES, feature_vector
-from heartbeat import HeartSoundAnalyzer
-from synth import synthesize
+from heartsound.classifier import FEATURE_NAMES, feature_vector
+from heartsound import HeartSoundAnalyzer
+from heartsound.synth import synthesize
 
 FS = 2000.0
 AN = HeartSoundAnalyzer()

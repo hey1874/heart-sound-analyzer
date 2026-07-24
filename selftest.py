@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from heartbeat import HeartSoundAnalyzer
-from synth import synthesize
+from heartsound import HeartSoundAnalyzer
+from heartsound.synth import synthesize
 
 FS = 2000.0
 CHECKS: list[tuple[str, callable]] = []
@@ -345,8 +345,12 @@ def _c_hrv():
                 + (f" LF/HF={long['lf_hf']:.2f}" if long["available"] else ""))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """跑全部检查,打印结果,返回失败数作为退出码。"""
+    from heartsound.cliutil import Parser
+    a = Parser("用合成心音验证算法方向正确性(失败返回非零退出码)").parse_args(
+        argv if argv is not None else [])
+    del a
     failed = 0
     for i, (name, fn) in enumerate(CHECKS, 1):
         try:
@@ -361,10 +365,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
-    try:   # Windows 控制台默认 GBK;stderr 也要一起切,否则报错信息乱码
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main())
+    from heartsound.cliutil import run
+    run(main)

@@ -16,14 +16,13 @@ train_cnn.py — 在 CirCor 上训练/评估频谱图 CNN 杂音检测器。
 
 from __future__ import annotations
 
-import csv
 import glob
 import os
-import sys
 
 import numpy as np
 
-from cnn import augment, build_model, windows
+from heartsound.cnn import augment, build_model, windows
+from heartsound.evalutil import auc, is_labeled, load_circor_meta, murmur_label
 
 
 def extract(directory: str, cache: str | None = None):
@@ -34,9 +33,7 @@ def extract(directory: str, cache: str | None = None):
         return d["S"], d["owner"], d["y"], d["pat"], d["name"]
 
     import soundfile as sf
-    meta_path = os.path.join(directory, "training_data.csv")
-    meta = {r["Patient ID"]: r for r in
-            csv.DictReader(open(meta_path, encoding="utf-8"))}
+    meta = load_circor_meta(directory)
     wavs = sorted(glob.glob(os.path.join(directory, "training_data", "*.wav"))) \
         or sorted(glob.glob(os.path.join(directory, "*.wav")))
     print(f"发现 {len(wavs)} 条录音,提取对数梅尔谱 ...")
@@ -49,7 +46,7 @@ def extract(directory: str, cache: str | None = None):
             continue
         pid, loc = parts[0], parts[1]
         m = meta.get(pid)
-        if m is None or m["Murmur"] == "Unknown":
+        if m is None or not is_labeled(m):
             continue
         try:
             sig, fs = sf.read(w)
@@ -63,8 +60,7 @@ def extract(directory: str, cache: str | None = None):
         r = len(y)
         S.extend(ws)
         owner.extend([r] * len(ws))
-        y.append(int(m["Murmur"] == "Present"
-                     and loc in (m["Murmur locations"] or "").split("+")))
+        y.append(murmur_label(m, loc))          # 定义见 heartsound.evalutil
         pat.append(pid)
         name.append(stem)
         if (i + 1) % 300 == 0:
@@ -83,13 +79,6 @@ def extract(directory: str, cache: str | None = None):
     return S, owner, y, pat, name
 
 
-def auc(score: np.ndarray, label: np.ndarray) -> float:
-    o = np.argsort(-score)
-    ys = label[o]
-    tpr = np.cumsum(ys) / max(1, ys.sum())
-    fpr = np.cumsum(1 - ys) / max(1, (1 - ys).sum())
-    trapz = getattr(np, "trapezoid", np.trapz)
-    return float(trapz(tpr, fpr))
 
 
 def aggregate(win_prob: np.ndarray, owner: np.ndarray, n_rec: int,
@@ -157,14 +146,16 @@ def run_fold(Str, ytr, Ste, epochs, device, seed=0, log=None):
     return np.concatenate(probs), model
 
 
-def main(argv):
-    if not argv or argv[0].startswith("-"):
-        print(__doc__)
-        return 1
-    directory = argv[0]
-    cache = argv[argv.index("--cache") + 1] if "--cache" in argv else "cnn_feats.npz"
-    epochs = int(argv[argv.index("--epochs") + 1]) if "--epochs" in argv else 40
-    folds = int(argv[argv.index("--folds") + 1]) if "--folds" in argv else 5
+def main(argv: list[str]) -> int:
+    from heartsound.cliutil import Parser
+    p = Parser("在 CirCor 上训练/评估频谱图 CNN 杂音检测器")
+    p.add_argument("directory", help="CirCor DigiScope 格式的数据集目录")
+    p.add_argument("--cache", default="cnn_feats.npz", help="频谱特征缓存文件")
+    p.add_argument("--epochs", type=int, default=40, help="每折训练轮数")
+    p.add_argument("--folds", type=int, default=5,
+                   help="按患者分组的折数;0 表示跳过交叉验证(配合 --save)")
+    p.add_argument("--save", help="交叉验证后在全量数据上重训并保存到该路径")
+    a = p.parse_args(argv)
 
     import torch
     from sklearn.model_selection import StratifiedGroupKFold
@@ -172,66 +163,61 @@ def main(argv):
     print(f"设备: {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
 
-    S, owner, y, pat, name = extract(directory, cache)
+    S, owner, y, pat, name = extract(a.directory, a.cache)
     print(f"\n窗 {len(S)} 个 / 录音 {len(y)} 条 / 患者 {len(set(pat.tolist()))} 名")
     print(f"阳性录音 {int(y.sum())} / 阴性 {int((1 - y).sum())}"
           f"  谱图尺寸 {S.shape[1]}×{S.shape[2]}")
-    n_par = sum(p.numel() for p in build_model().parameters())
-    print(f"模型参数量 {n_par / 1e3:.0f}k")
+    print(f"模型参数量 {sum(q.numel() for q in build_model().parameters()) / 1e3:.0f}k")
 
     win_y = y[owner]
     rec_score = np.zeros(len(y))
-    # --folds 0:跳过交叉验证,直接走 --save 的全量重训(已知性能时省时间)
-    skf = (StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=0)
-           if folds >= 2 else None)
-    for k, (tr_r, te_r) in enumerate(
-            skf.split(np.zeros(len(y)), y, pat) if skf else [], 1):
+
+    def save_full():
+        print(f"\n在全部 {len(y)} 条录音({len(S)} 窗)上训练并保存 -> {a.save}")
+        _, model = run_fold(S, win_y, S[:1], a.epochs, device, seed=0, log=True)
+        torch.save({"state_dict": model.state_dict(),
+                    "n_mels": int(S.shape[1]), "frames": int(S.shape[2]),
+                    "trained_on": os.path.abspath(a.directory),
+                    "n_recordings": int(len(y))}, a.save)
+        print("完成。加载见 heartsound.cnn.load_model()")
+
+    if a.folds < 2:
+        print("\n(--folds < 2:已跳过交叉验证)")
+        if a.save:
+            save_full()
+        return 0
+
+    skf = StratifiedGroupKFold(n_splits=a.folds, shuffle=True, random_state=0)
+    for k, (tr_r, te_r) in enumerate(skf.split(np.zeros(len(y)), y, pat), 1):
         tr_w = np.isin(owner, tr_r)
         te_w = np.isin(owner, te_r)
-        print(f"\n--- 第 {k}/{folds} 折: 训练 {tr_w.sum()} 窗 / 测试 {te_w.sum()} 窗 ---")
-        p, _ = run_fold(S[tr_w], win_y[tr_w], S[te_w], epochs, device,
-                        seed=k, log=True)
-        # 折内映射回录音
+        print(f"\n--- 第 {k}/{a.folds} 折: 训练 {tr_w.sum()} 窗 / 测试 {te_w.sum()} 窗 ---")
+        pr, _ = run_fold(S[tr_w], win_y[tr_w], S[te_w], a.epochs, device,
+                         seed=k, log=True)
         sub_owner = owner[te_w]
         for r in te_r:
-            pr = p[sub_owner == r]
-            rec_score[r] = np.quantile(pr, 0.8) if len(pr) else 0.0
+            q = pr[sub_owner == r]
+            rec_score[r] = np.quantile(q, 0.8) if len(q) else 0.0
         print(f"    本折录音级 AUC {auc(rec_score[te_r], y[te_r]):.3f}")
 
     print("\n" + "=" * 60)
-    print(f"录音级 AUC(按患者分组 {folds} 折) = {auc(rec_score, y):.3f}")
-    print("  对照:工程特征 + 树模型基线 AUC 0.793(仅门控后)/ 0.775(全部)")
-    print("       单一 murmur_sys 指标 AUC 0.715")
+    print(f"录音级 AUC(按患者分组 {a.folds} 折) = {auc(rec_score, y):.3f}")
+    print("  对照:工程特征 + 树模型 AUC 0.876;单一 murmur_sys 指标 0.715")
 
-    # 患者级:各听诊区取最大
-    meta = {r["Patient ID"]: r for r in csv.DictReader(
-        open(os.path.join(directory, "training_data.csv"), encoding="utf-8"))}
+    meta = load_circor_meta(a.directory)
     pids = sorted(set(pat.tolist()))
-    ps = np.array([rec_score[pat == p].max() for p in pids])
-    py = np.array([int(meta[p]["Murmur"] == "Present") for p in pids])
+    ps = np.array([rec_score[pat == q].max() for q in pids])
+    py = np.array([int(meta[q]["Murmur"] == "Present") for q in pids])
     print(f"患者级 AUC(各区取最大,{len(pids)} 名)= {auc(ps, py):.3f}")
     print("  对照:murmur_sys 多区取最大 AUC 0.762")
 
     np.savez("cnn_scores.npz", rec_score=rec_score, y=y, pat=pat, name=name)
     print("\n已保存逐条得分 -> cnn_scores.npz")
-
-    if "--save" in argv:
-        # 交叉验证只用于估性能;要部署或做外部验证,需在**全量**数据上重训
-        out = argv[argv.index("--save") + 1]
-        print(f"\n在全部 {len(y)} 条录音({len(S)} 窗)上重训并保存 -> {out}")
-        _, model = run_fold(S, win_y, S[:1], epochs, device, seed=0, log=True)
-        torch.save({"state_dict": model.state_dict(),
-                    "n_mels": int(S.shape[1]), "frames": int(S.shape[2]),
-                    "trained_on": os.path.abspath(directory),
-                    "n_recordings": int(len(y))}, out)
-        print("完成。加载见 cnn.load_model()")
+    if a.save:
+        save_full()
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    sys.exit(main(sys.argv[1:]))
+    from heartsound.cliutil import run
+    run(main)

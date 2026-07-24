@@ -1,16 +1,22 @@
-# 核心算法依赖
+# 推荐用 pyproject.toml 安装(依赖分层,核心只要 numpy+scipy):
+#     pip install -e .            # 核心
+#     pip install -e ".[all]"     # 全部
+# 本文件保留给不想用 pip install -e 的场景。
+
+# 核心算法
 numpy>=1.23
 scipy>=1.9
 
-# 实时麦克风采集(离线/自测不需要)
+# 实时麦克风采集 / 读音频文件([audio])
 sounddevice>=0.4
+soundfile>=0.12
 
-# ML 分类基线(classifier.py / predict.py)
+# ML 分类基线与阈值标定([ml])
 scikit-learn>=1.2
 joblib>=1.2
 
-# 读取音频文件(predict.py 处理 wav / PhysioNet 加载)
-soundfile>=0.12
-
-# 测试(可选;selftest.py 本身只需 numpy+scipy)
+# 测试([test])
 pytest>=7.0
+
+# 可选:频谱图 CNN([cnn]),需按平台选 CUDA 版本,故不在此固定
+# torch>=2.0

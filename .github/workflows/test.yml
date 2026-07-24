@@ -17,7 +17,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       # 核心算法与测试不需要 sounddevice(它要系统级 PortAudio),单独装依赖
-      - run: pip install numpy scipy scikit-learn joblib pytest
+      # 分层安装:先验核心只靠 numpy+scipy 就能用,再装完整依赖跑测试
+      - run: pip install -e .
+      - name: 核心包在最小依赖下可用
+        run: python -c "from heartsound import HeartSoundAnalyzer, synthesize; x,fs=synthesize(secs=8); print(HeartSoundAnalyzer().analyze(x,fs)['bpm'])"
+      - run: pip install -e ".[all]"
       - name: 自测(失败返回非零退出码)
         run: python selftest.py
       - name: pytest

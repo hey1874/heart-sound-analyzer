@@ -3,9 +3,10 @@
 import numpy as np
 import pytest
 
-from classifier import FEATURE_NAMES, feature_vector, threshold_baseline
-from heartbeat import HeartSoundAnalyzer, _movavg
-from synth import synthesize
+from heartsound.classifier import FEATURE_NAMES, feature_vector, threshold_baseline
+from heartsound import HeartSoundAnalyzer
+from heartsound.dsp import _movavg
+from heartsound.synth import synthesize
 
 FS = 2000.0
 
@@ -133,10 +134,40 @@ def test_threshold_baseline_runs():
     assert 0.0 <= b["acc"] <= 1.0
 
 
-def test_predict_cli_missing_model_arg():
-    """回归:`--model` 作为最后一个参数曾直接 IndexError。"""
-    from predict import main
-    assert main(["x.wav", "--model"]) == 1
+@pytest.mark.parametrize("mod,args", [
+    ("predict", ["x.wav", "--model"]),
+    ("checkmic", ["--device"]),
+    ("calibrate", ["x", "--out"]),
+    ("calibrate", ["x", "--limit"]),
+    ("external_eval", ["x", "--cnn"]),
+    ("external_eval", ["x", "--per-subset"]),
+    ("train_cnn", ["x", "--epochs"]),
+    ("train_cnn", ["x", "--save"]),
+    ("heartbeat", ["--window"]),
+])
+def test_cli_missing_arg_value_exits_cleanly(mod, args):
+    """回归:参数后面漏了值,不能抛 IndexError 栈回溯。
+
+    这些 CLI 原先都手写 `argv[argv.index("--x") + 1]`,漏值即 IndexError。
+    实测 5 个工具会崩(predict.py 里同样的 bug 早先单独修过一次,但同样的
+    写法又被复制到了后来新增的工具里)。现在统一走 argparse,由标准库报出
+    清晰的用法提示并以退出码 2 结束。
+    """
+    m = __import__(mod)
+    with pytest.raises(SystemExit) as e:
+        m.main(args)
+    assert e.value.code == 2, f"{mod} {args} 应以退出码 2 结束"
+
+
+@pytest.mark.parametrize("mod", ["predict", "checkmic", "calibrate",
+                                 "external_eval", "train_cnn", "heartbeat",
+                                 "classifier", "selftest"])
+def test_cli_has_help_and_disclaimer(mod):
+    """每个入口都要有 --help,且带医疗免责声明(由 cliutil.Parser 统一保证)。"""
+    m = __import__(mod)
+    with pytest.raises(SystemExit) as e:
+        m.main(["--help"])
+    assert e.value.code == 0
 
 
 # --- 标定 -------------------------------------------------------------------
@@ -165,7 +196,7 @@ def test_from_json_overrides_win():
 
 def test_calibrate_module_imports():
     """calibrate.py 应可被导入(不依赖数据集存在)。"""
-    import calibrate
+    import calibrate  # noqa: F401
     assert callable(calibrate.reference_bpm)
     assert calibrate.reference_bpm([(0.0, 0.1, 1)]) is None
     segs = [(i * 0.8, i * 0.8 + 0.1, 1) for i in range(8)]

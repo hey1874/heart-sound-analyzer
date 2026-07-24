@@ -89,10 +89,19 @@ an = HeartSoundAnalyzer.from_json("thresholds.json", operating_point="sens80")
 ## 安装
 
 ```bash
-pip install -r requirements.txt
+pip install -e .            # 核心:只要 numpy + scipy
+pip install -e ".[all]"     # 全部:含实时采集、ML 分类、测试
 ```
 
-核心算法仅需 `numpy` + `scipy`;`sounddevice` 只在实时采集时需要。
+依赖是**分层**的——核心算法(分段 F1 0.931、心率、SQI 这些经过真实数据验证的
+能力)只需要 `numpy` + `scipy`,方便被别的项目直接引用:
+
+| 可选组 | 装了才有 | 依赖 |
+|---|---|---|
+| `[audio]` | 实时采集、读音频文件 | sounddevice, soundfile |
+| `[ml]` | 分类基线、阈值标定 | scikit-learn, joblib |
+| `[cnn]` | 频谱图 CNN(AUC 0.948) | torch |
+| `[test]` | 测试套件 | pytest |
 
 ## 快速开始
 
@@ -138,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install pytest && python -m pytest tests/ -q      # 102 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 118 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
@@ -186,7 +195,7 @@ python heartbeat.py
 
 ```python
 import soundfile as sf                    # 读音频文件需额外:pip install soundfile
-from heartbeat import HeartSoundAnalyzer
+from heartsound import HeartSoundAnalyzer
 
 x, fs = sf.read("recording.wav")          # 任意采样率
 res = HeartSoundAnalyzer().analyze(x, fs)
@@ -204,6 +213,13 @@ else:
 
 ```python
 HeartSoundAnalyzer(murmur_thr=0.22, sqi_thr=0.40, conf_thr=0.20)
+```
+
+`heartbeat.py` 仍可用(`from heartbeat import HeartSoundAnalyzer` 与
+`python heartbeat.py` 都不变),它现在是指向 `heartsound` 包的兼容垫片。
+
+```python
+an = HeartSoundAnalyzer.from_json("thresholds.json", operating_point="sens80")
 ```
 
 ## 正常/异常分类(ML 基线)
@@ -279,14 +295,29 @@ python predict.py --selftest          # 合成杂音信号自检
 ## 目录
 
 ```
-heartbeat.py          核心算法 HeartSoundAnalyzer + 实时采集 RealtimeHeartRate
-synth.py              合成心音生成器(自测与 ML 管线验证用)
+heartsound/           核心包(pip 可安装)
+  analyzer.py           HeartSoundAnalyzer 主类:构造、analyze()、标定加载
+  dsp.py                滤波、包络、心率估计
+  quality.py            削波、工频、SQI、可采信判定
+  segmentation.py       S1/S2 分段与心动周期重建
+  features.py           节律、STI、杂音、频谱轮廓、额外音、S2 分裂、HRV
+  realtime.py           RealtimeHeartRate 实时采集
+  synth.py              合成心音生成器
+  classifier.py         特征向量 + HistGradientBoosting 分类基线
+  cnn.py                对数梅尔谱 + CNN(可选)
+  evalutil.py           AUC、CirCor 加载、**杂音标签的唯一定义**
+  cliutil.py            argparse 封装与控制台编码
+
+heartbeat.py          兼容垫片 + 实时采集命令行
 checkmic.py           采集链路体检(低频高通/工频/削波/电平/AGC)
 selftest.py           22 项自测,含阴性对照,失败返回非零退出码
 calibrate.py          在真实标注数据上标定阈值 + 验证分段/杂音/分类器
-classifier.py         特征向量 + HistGradientBoosting 分类基线 + 数据加载
+classifier.py         分类器训练/评估命令行
 predict.py            对录音做预测的 CLI(带信号质量门控)
-tests/                pytest 套件(复用 selftest.CHECKS + 单元测试)
+external_eval.py      在 CinC 2016 上做外部验证
+train_cnn.py          训练/评估频谱图 CNN
+tests/                pytest 套件(118 项)
+pyproject.toml        打包配置(依赖分层)
 docs/VALIDATION.md    真实数据(CirCor)实测结果 + 阈值的文献依据
 docs/ALGORITHM.md     各步骤算法与医学依据
 docs/HARDWARE.md      听诊器/WM-61A/声卡 接入与避坑
