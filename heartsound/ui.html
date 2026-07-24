@@ -508,7 +508,7 @@ function renderSiteList(best) {
   const s = SITES.sites.find(v => v.code === curSite);
   const vn = $("viewnote");
   if (vn) vn.innerHTML = (SITES.view_note || "") +
-    '<br><span style="opacity:.75">底图:Gray's Anatomy(1918)胸廓版画,公有领域</span>';
+    "<br><span style=\"opacity:.75\">底图:Gray's Anatomy(1918)胸廓版画,公有领域</span>";
   $("sitehint").innerHTML =
     `<b>${s.name}</b> · ${s.landmark}
      <span style="color:var(--fg-3)">(第 ${s.ics} 肋间,受检者${
