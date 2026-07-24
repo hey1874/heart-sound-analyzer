@@ -579,15 +579,20 @@ function render(d) {
   const idle = d.status === "idle" || (d.status === "stopped" && !d.wave);
   const stopped = d.status === "stopped" && !!d.wave;
   if (idle) {
+    // 「停止但没采到东西」和「压根没开始」要分开说,不然用户会以为没点上
+    const ranBriefly = d.status === "stopped";
     $("dev").textContent = "";
     pip.style.background = cssv("--fg-3"); pip.classList.remove("live");
-    st.textContent = "未开始"; st.style.color = cssv("--fg-2");
+    st.textContent = ranBriefly ? "已停止" : "未开始";
+    st.style.color = cssv("--fg-2");
     $("gate").classList.add("on");
     $("gate").style.borderLeftColor = cssv("--fg-3");
     $("gateTitle").style.color = cssv("--fg");
-    $("gateTitle").textContent = "尚未开始采集";
-    $("gateWhy").textContent =
-      "麦克风还没有打开。把听诊器贴到上面选中的听诊区,再按右上角「开始采集」。";
+    $("gateTitle").textContent = ranBriefly ? "已停止,这一轮没采到数据"
+                                            : "尚未开始采集";
+    $("gateWhy").textContent = ranBriefly
+      ? "还没攒满一个分析窗就停了。再按「开始采集」,让它至少跑满几秒。"
+      : "麦克风还没有打开。把听诊器贴到上面选中的听诊区,再按右上角「开始采集」。";
     $("tierA").classList.add("dimmed");
     $("tierB").classList.add("dimmed");
     return;
@@ -606,7 +611,9 @@ function render(d) {
   if (d.status !== "ok" && !stopped) {
     $("dev").textContent = d.device ? `${d.device} · ${d.fs} Hz` : "";
     pip.style.background = cssv("--warn"); pip.classList.add("live");
-    st.textContent = "缓冲中"; st.style.color = cssv("--warn");
+    // 攒满一个分析窗要好几秒;不报进度,这几秒看着就像没点上
+    const pct = d.fill != null ? ` ${Math.round(d.fill * 100)}%` : "";
+    st.textContent = "缓冲中" + pct; st.style.color = cssv("--warn");
     $("gate").classList.remove("on");
     return;
   }

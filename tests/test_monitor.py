@@ -522,6 +522,7 @@ class _FakeCap:
 
     def __init__(self, device=None, window_s=6.0):
         self.fs, self.device_name, self.xruns = 8000, "fake", 0
+        self.fill_ratio = 0.5
         self._n = 0
 
     def start(self):
@@ -731,3 +732,155 @@ def test_ui_has_start_and_stop_buttons_wired_to_setcapture():
     assert "disabled" not in go, "开始键初始不该禁用"
     assert "disabled" in stop[:stop.index("</button>")], "停止键初始应禁用"
     assert 'method: "POST"' in src, "前端必须用 POST 调开关"
+
+
+class _SlowCap(_FakeCap):
+    """snapshot 故意慢,好在"线程正忙"时插入 停->开。"""
+
+    def snapshot(self, min_new_s=0.0):
+        time.sleep(0.25)
+        return np.random.default_rng(0).normal(0, 0.01, 8000 * 4).astype(np.float32)
+
+
+def test_restart_while_busy_still_reopens_the_device(monkeypatch):
+    """停了又开,即便采集线程当时正忙,也必须重开设备。
+
+    只看 state.capture 是不够的:线程卡在 snapshot/analyze 期间发生 停->开,
+    回来看到的仍是 True,于是**不重开**——停止前的旧音频就留在环形缓冲里,
+    混进重新开始后的第一窗。用代次计数堵这个洞。
+    """
+    from heartsound import monitor
+    monkeypatch.setattr(monitor, "MicCapture", _SlowCap)
+    _FakeCap.opened = _FakeCap.closed = 0
+
+    st = monitor.State()
+    t = threading.Thread(target=monitor.capture_loop, daemon=True,
+                         args=(st, None, 4.0, 0.1, 0.30))
+    t.start()
+    try:
+        st.set_capture(True)
+        deadline = time.time() + 5
+        while _FakeCap.opened == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.opened == 1
+
+        g0 = st.gen
+        st.set_capture(False)          # 趁 snapshot 还在 sleep 里
+        time.sleep(0.005)
+        st.set_capture(True)
+        assert st.gen == g0 + 1, "「开始」必须让代次自增"
+
+        deadline = time.time() + 5
+        while _FakeCap.opened < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.opened == 2, "快速停/开之后设备应被重开(否则沿用旧缓冲)"
+        assert _FakeCap.closed >= 1
+    finally:
+        st.stop = True
+        st.set_capture(False)
+        t.join(timeout=3)
+
+
+def test_gen_does_not_bump_when_already_capturing():
+    """重复按「开始」不该重开设备。"""
+    from heartsound.monitor import State
+    st = State()
+    st.set_capture(True)
+    g = st.gen
+    st.set_capture(True)
+    assert st.gen == g and st.get()["elapsed_s"] >= 0
+
+
+def test_fill_ratio_reports_buffer_progress():
+    """按下开始后要等满一个窗才有结果,这段进度必须能报出来。"""
+    from heartsound.capture import MicCapture
+    cap = MicCapture.__new__(MicCapture)
+    cap._ring = None
+    cap._lock = threading.Lock()
+    assert cap.fill_ratio == 0.0, "还没开流时应为 0"
+
+    cap._ring = np.zeros(1000, dtype=np.float32)
+    for filled, want in ((0, 0.0), (250, 0.25), (1000, 1.0), (5000, 1.0)):
+        cap._filled = filled
+        assert cap.fill_ratio == want, f"_filled={filled}"
+
+
+def test_buffering_status_does_not_override_a_good_frame(monkeypatch):
+    """出过结果之后就不该再退回「缓冲中」——那样界面会来回跳。"""
+    from heartsound import monitor
+
+    class _Cap(_FakeCap):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.fill_ratio = 0.5
+
+        def snapshot(self, min_new_s=0.0):
+            self._n += 1
+            if self._n == 2:                # 只给一帧,之后一直 None
+                return np.random.default_rng(0).normal(
+                    0, 0.01, 8000 * 4).astype(np.float32)
+            return None
+
+    monkeypatch.setattr(monitor, "MicCapture", _Cap)
+    st = monitor.State()
+    t = threading.Thread(target=monitor.capture_loop, daemon=True,
+                         args=(st, None, 4.0, 0.1, 0.30))
+    t.start()
+    try:
+        st.set_capture(True)
+        deadline = time.time() + 8
+        while st.get().get("status") != "ok" and time.time() < deadline:
+            time.sleep(0.02)
+        assert st.get()["status"] == "ok", "应当出过一帧结果"
+        time.sleep(0.5)                     # 之后 snapshot 一直返回 None
+        assert st.get()["status"] == "ok", "不该退回「缓冲中」"
+    finally:
+        st.stop = True
+        st.set_capture(False)
+        t.join(timeout=3)
+
+
+def test_capture_thread_survives_an_unexpected_error(monkeypatch):
+    """采集循环里的意外异常不能让线程悄悄死掉。
+
+    线程一死,界面会**永远停在「缓冲中」**——最坏的一种失败:看上去像还在
+    工作,其实什么都不会再发生。必须落回停止态并把原因显示出来。
+
+    这个洞是加"缓冲进度"时暴露的:替身没有 fill_ratio,生产代码一调用就
+    AttributeError,线程当场没了,而测试只看到"设备没重开"。
+    """
+    from heartsound import monitor
+
+    class _Weird(_FakeCap):
+        def snapshot(self, min_new_s=0.0):
+            raise RuntimeError("driver went away")
+
+    monkeypatch.setattr(monitor, "MicCapture", _Weird)
+    _FakeCap.opened = _FakeCap.closed = 0
+
+    st = monitor.State()
+    t = threading.Thread(target=monitor.capture_loop, daemon=True,
+                         args=(st, None, 4.0, 0.1, 0.30))
+    t.start()
+    try:
+        st.set_capture(True)
+        deadline = time.time() + 5
+        while st.get().get("status") != "error" and time.time() < deadline:
+            time.sleep(0.02)
+        d = st.get()
+        assert d["status"] == "error", "异常必须变成可见的错误状态"
+        assert "driver went away" in d["message"]
+        assert st.capture is False, "出错后应落回停止态"
+        assert _FakeCap.closed >= 1, "出错时也要关掉设备"
+        assert t.is_alive(), "线程不该死——否则再按开始也没反应"
+
+        # 线程还活着,就应该还能重新开始
+        st.set_capture(True)
+        deadline = time.time() + 5
+        while _FakeCap.opened < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert _FakeCap.opened >= 2, "出错之后仍要能重新开始"
+    finally:
+        st.stop = True
+        st.set_capture(False)
+        t.join(timeout=3)

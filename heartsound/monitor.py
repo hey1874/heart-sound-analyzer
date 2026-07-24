@@ -131,6 +131,11 @@ class State:
         # 随之熄灭,设备也交还给别的程序——只是"不分析"做不到这一点。
         self.capture = bool(capture)
         self.t0: float | None = time.monotonic() if capture else None
+        # 每次「开始」自增。采集线程只看 capture 是不够的:若在它忙于
+        # snapshot/analyze 期间发生 停->开,再回来看到的仍是 True,设备便
+        # 不会重开,**停止前的旧音频会留在环形缓冲里进入第一窗**。代次变了
+        # 就重开,这个洞才堵上。
+        self.gen = 0
         # 当前听诊区。杂音是位置依赖的(多区取最大可把患者级 AUC 从 0.701
         # 提到 0.762),而且 AV/PV/TV/MV 正是 CirCor 的标签——标上位置,
         # 采到的数据才能直接喂给 calibrate.py。
@@ -161,6 +166,7 @@ class State:
             was, self.capture = self.capture, on
             if on and not was:
                 self.t0 = time.monotonic()
+                self.gen += 1
                 self.data = {"status": "waiting"}
             elif not on and was:
                 self.t0 = None
@@ -255,49 +261,82 @@ def capture_loop(state: State, device, window_s: float, hop_s: float,
                  conf_gate: float) -> None:
     """采集线程:按 state.capture 开合输入流。
 
-    停止时**关闭** MicCapture 而不是继续读着不analyze——两点差别是实的:
-    录音指示灯会灭,设备也让给别的程序。另外重新开始时环形缓冲是新的,
-    不会把停下来之前的旧音频算进第一窗。
+    停止时**关闭** MicCapture,而不是继续读着但不分析——两点差别是实的:
+    录音指示灯会灭,设备也交还给别的程序。重新开始时环形缓冲是新的,不会
+    把停止之前的旧音频算进第一窗。
     """
     an = HeartSoundAnalyzer(conf_thr=conf_gate)
     cap = None
+    gen = -1
     try:
         while not state.stop:
-            if not state.capture:
-                if cap is not None:
-                    cap.stop()
-                    cap = None
-                threading.Event().wait(0.05)
-                continue
-
-            if cap is None:
-                try:
-                    cap = MicCapture(device=device, window_s=window_s).start()
-                except Exception as e:                  # noqa: BLE001
-                    # 先落回停止态,免得每 50ms 重试一次;再写错误信息,
-                    # 顺序反了会被 set_capture 覆盖掉。
-                    state.set_capture(False)
-                    state.set({"status": "error",
-                               "message": f"打不开输入设备:{type(e).__name__}: {e}"})
-                    continue
-                state.set({"status": "waiting", "device": cap.device_name,
-                           "fs": cap.fs})
-
-            snap = cap.snapshot(min_new_s=hop_s)
-            if snap is None:
-                threading.Event().wait(0.1)
-                continue
             try:
-                res = an.analyze(snap, cap.fs)
+                if not state.capture:
+                    if cap is not None:
+                        cap.stop()
+                        cap = None
+                    threading.Event().wait(0.05)
+                    continue
+
+                if cap is None or gen != state.gen:
+                    if cap is not None:      # 期间发生过 停->开,重开拿新缓冲
+                        cap.stop()
+                        cap = None
+                    # 先记代次:开设备期间若又被翻,下一圈还会重开,不会漏掉
+                    gen = state.gen
+                    try:
+                        cap = MicCapture(device=device,
+                                         window_s=window_s).start()
+                    except Exception as e:              # noqa: BLE001
+                        # 先落回停止态,免得每 50ms 重试一次;顺序反了会被
+                        # set_capture 覆盖掉错误信息。
+                        state.set_capture(False)
+                        state.set({"status": "error",
+                                   "message": f"打不开输入设备:"
+                                              f"{type(e).__name__}: {e}"})
+                        continue
+                    state.set({"status": "waiting", "device": cap.device_name,
+                               "fs": cap.fs})
+
+                snap = cap.snapshot(min_new_s=hop_s)
+                if snap is None:
+                    # 缓冲未满时报进度:否则按下开始后的头几秒界面毫无反应,
+                    # 看着就像没点上。已经出过结果就不要再退回"缓冲中"——
+                    # 那样界面会来回跳。
+                    if state.get().get("status") in ("waiting", "buffering"):
+                        state.set({"status": "buffering",
+                                   "device": cap.device_name, "fs": cap.fs,
+                                   "fill": round(cap.fill_ratio, 3)})
+                    threading.Event().wait(0.1)
+                    continue
+
+                try:
+                    res = an.analyze(snap, cap.fs)
+                except Exception as e:                  # noqa: BLE001
+                    state.set({"status": "error",
+                               "message": f"分析出错:{type(e).__name__}: {e}"})
+                    continue
+
+                # 分析期间被叫停(或停了又开)——这一帧属于上一轮,丢掉
+                if not state.capture or gen != state.gen:
+                    continue
+                state.note_quality((res.get("sqi") or {}).get("sqi"))
+                state.set(_build_payload(an, res, cap.fs, cap.device_name,
+                                         cap.xruns))
+
             except Exception as e:                      # noqa: BLE001
+                # 兜底。原先没有:循环里冒出任何意外异常,线程就**悄悄死掉**,
+                # 而界面会一直停在"缓冲中"——最坏的一种失败,看上去像还在
+                # 工作。现在一律落回停止态并把原因显示出来。
+                if cap is not None:
+                    try:
+                        cap.stop()
+                    except Exception:                   # noqa: BLE001
+                        pass
+                    cap = None
+                state.set_capture(False)
                 state.set({"status": "error",
-                           "message": f"分析出错:{type(e).__name__}: {e}"})
-                continue
-            if not state.capture:      # 分析期间被叫停,别再盖掉"已停止"
-                continue
-            state.note_quality((res.get("sqi") or {}).get("sqi"))
-            state.set(_build_payload(an, res, cap.fs, cap.device_name,
-                                     cap.xruns))
+                           "message": f"采集线程出错:{type(e).__name__}: {e}"})
     finally:
         if cap is not None:
             cap.stop()
