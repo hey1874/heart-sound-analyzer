@@ -60,6 +60,11 @@ body{background:var(--bg);color:var(--fg);font:15px/1.7 var(--sans);
 .torso .dot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .torso .lbl{font:600 9px var(--sans);fill:var(--fg-2);pointer-events:none}
 .torso .lbl.on{fill:var(--accent)}
+.torso .side{font:700 9px var(--sans);fill:var(--fg-3);pointer-events:none}
+.torso .ics{font:9px var(--num);fill:var(--fg-3);pointer-events:none}
+.torso .rib{stroke:var(--line);stroke-width:1}
+.viewnote{font-size:12px;color:var(--fg-3);text-align:center;margin-top:6px;
+          line-height:1.45}
 .sitelist{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:11px}
 .sitebtn{font:500 13.5px var(--sans);padding:8px 13px;border-radius:7px;cursor:pointer;
          border:1px solid var(--line);background:var(--card);color:var(--fg-2)}
@@ -146,8 +151,11 @@ code{font-family:var(--num);font-size:13px;background:var(--track);
   </div>
 
   <div class="site">
-    <svg class="torso" id="torso" viewBox="0 0 200 260" role="group"
-         aria-label="听诊区位置示意图"></svg>
+    <div>
+      <svg class="torso" id="torso" viewBox="0 0 200 260" role="group"
+           aria-label="听诊区位置示意图,正面视角"></svg>
+      <div class="viewnote" id="viewnote"></div>
+    </div>
     <div>
       <div class="sitelist" id="sitelist"></div>
       <div class="sitehint" id="sitehint"></div>
@@ -461,12 +469,23 @@ function drawTorso(best) {
             text-anchor="middle">${s.code}${q ? " " + q.toFixed(2) : ""}</text>
     </g>`;
   }).join("");
+  // 肋间刻度:让"第几肋间"在图上是可数的,而不是只靠文字描述
+  const ribs = [2, 3, 4, 5].map(n => {
+    const y = 78 + (n - 2) * 39;
+    return `<line class="rib" x1="58" y1="${y}" x2="142" y2="${y}"/>
+            <text class="ics" x="52" y="${y + 3}" text-anchor="end">${n}</text>`;
+  }).join("");
   svg.innerHTML = `
     <path class="body" d="M42 34 q58 -20 116 0 l12 40 q-8 22 -10 62
                           q-2 60 -18 108 q-40 12 -84 0
                           q-16 -48 -18 -108 q-2 -40 -10 -62 z"/>
-    <line class="sternum" x1="100" y1="52" x2="100" y2="170"/>
+    ${ribs}
+    <line class="sternum" x1="100" y1="52" x2="100" y2="178"/>
     <text class="lbl" x="100" y="46" text-anchor="middle">胸骨</text>
+    <text class="side" x="20" y="150" text-anchor="middle">受检者
+      <tspan x="20" dy="11">右侧</tspan></text>
+    <text class="side" x="180" y="150" text-anchor="middle">受检者
+      <tspan x="180" dy="11">左侧</tspan></text>
     ${dots}`;
 }
 
@@ -489,8 +508,12 @@ function renderSiteList(best) {
       q ? `<span class="q">最佳 ${q.toFixed(2)}</span>` : ""}</button>`;
   }).join("");
   const s = SITES.sites.find(v => v.code === curSite);
+  const vn = $("viewnote");
+  if (vn) vn.textContent = SITES.view_note || "";
   $("sitehint").innerHTML =
-    `<b>${s.name}</b> · ${s.landmark}<br>此处主要听:${s.listen_for}
+    `<b>${s.name}</b> · ${s.landmark}
+     <span style="color:var(--fg-3)">(第 ${s.ics} 肋间,受检者${
+       s.side === "R" ? "右" : "左"}侧)</span><br>此处主要听:${s.listen_for}
      <div class="tip">${SITES.tip}<br>
      ⚠️ 工具<b>无法判断你是否贴在正确位置</b>——它只能告诉你信号好不好。
      贴稳后慢慢挪动,看上方 SQI 哪里最高。</div>`;

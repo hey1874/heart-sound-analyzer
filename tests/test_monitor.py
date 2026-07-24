@@ -218,3 +218,33 @@ def test_state_get_is_a_snapshot():
     d = st.get()
     d["status"] = "tampered"
     assert st.get()["status"] == "ok"
+
+
+def test_diagram_sidedness_is_self_consistent_and_labelled():
+    """示意图左右必须与文字定位一致,且视角必须在图上标明。
+
+    这是**会导致贴错位置**的歧义:图按正面视角画(面对受检者),所以受检者
+    的左侧出现在图的右边——主动脉瓣区在胸骨右缘,却画在图的左侧。图上不标
+    视角,就会有人当成"这是我自己"而把左右完全贴反。
+    """
+    from heartsound.sites import SITES, VIEW_NOTE
+    assert "正面视角" in VIEW_NOTE and "左侧" in VIEW_NOTE
+    for s in SITES:
+        assert s["side"] in ("L", "R"), f"{s['code']} 缺 side"
+        assert 1 <= s["ics"] <= 6, f"{s['code']} 肋间号不合理"
+        # 正面视角:受检者右侧 -> 图的左半(x<0.5),反之亦然
+        assert (s["side"] == "R") == (s["xy"][0] < 0.5), \
+            f"{s['code']} 的 side={s['side']} 与示意图坐标 x={s['xy'][0]} 矛盾"
+        # 文字定位里的"左/右缘"要和 side 对上
+        if "右缘" in s["landmark"]:
+            assert s["side"] == "R", f"{s['code']} 文字写右缘但 side=L"
+        if "左缘" in s["landmark"] or "左锁骨" in s["landmark"]:
+            assert s["side"] == "L", f"{s['code']} 文字写左侧但 side=R"
+
+
+def test_sites_ics_increases_downward_on_diagram():
+    """肋间号越大位置越靠下——图上的 y 坐标必须单调对应。"""
+    from heartsound.sites import SITES
+    pairs = sorted((s["ics"], s["xy"][1]) for s in SITES)
+    ys = [y for _, y in pairs]
+    assert ys == sorted(ys), f"肋间号与图上高度不单调:{pairs}"

@@ -297,9 +297,9 @@ def make_handler(state: State):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):                               # noqa: N802
             if self.path.startswith("/api/sites"):
-                from .sites import FIND_TIP, ORDER, SITES
+                from .sites import FIND_TIP, ORDER, SITES, VIEW_NOTE
                 body = json.dumps({"sites": SITES, "order": ORDER,
-                                   "tip": FIND_TIP},
+                                   "tip": FIND_TIP, "view_note": VIEW_NOTE},
                                   ensure_ascii=False).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

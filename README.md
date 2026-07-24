@@ -147,7 +147,7 @@ python heartbeat.py --selftest     # 或 python selftest.py
 完整测试套件(单元测试 + 性质检查):
 
 ```bash
-pip install -e ".[test]" && python -m pytest tests/ -q   # 152 passed
+pip install -e ".[test]" && python -m pytest tests/ -q   # 154 passed
 ```
 
 `tests/test_properties.py` 断言的是"任何输入下都必须成立"的契约(退化输入不
@@ -202,6 +202,10 @@ python monitor.py --device 2 --port 8800
 找位置的办法:先摸到**胸骨角**(胸骨上段的横向骨嵴),它平对第 2 肋,紧邻其下
 就是第 2 肋间,由此往下数。
 
+> ⚠️ 示意图为**正面视角**(面对受检者),因此**图的右边 = 受检者的左侧**
+> ——主动脉瓣区在胸骨右缘,画在图的左侧。图上已标出左右与肋间刻度,但
+> **以文字定位为准**。
+>
 > ⚠️ 工具**无法判断你是否贴在正确位置**,它只能告诉你信号好不好。
 > 代号 AV/PV/TV/MV 与 CirCor 数据集一致——录音时标上位置,数据才能直接
 > 喂给 `calibrate.py` 标定。多区录音也是实测中投入产出比最高的改进
